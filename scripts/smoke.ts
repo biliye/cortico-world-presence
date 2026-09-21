@@ -40,9 +40,13 @@ async function main(): Promise<void> {
 
   console.log('[3/3] 截一张全屏……');
   const shot = await captureScreenshot({ target: 'full' });
-  const file = new URL('../presence-smoke.png', import.meta.url);
-  writeFileSync(file, shot.png);
-  console.log(`  ${shot.width}x${shot.height}，${(shot.png.length / 1024).toFixed(0)} KiB，落在 ${file.pathname.replace(/^\/(\w:)/, '$1')}`);
+  const ext = shot.format === 'jpeg' ? 'jpg' : 'png';
+  const file = new URL(`../presence-smoke.${ext}`, import.meta.url);
+  writeFileSync(file, shot.bytes);
+  const pngNote = shot.format === 'jpeg' ? `（PNG 本会是更大的体积，已按照片类画面压成 JPEG）` : '';
+  console.log(
+    `  ${shot.width}x${shot.height}，${shot.format.toUpperCase()} ${(shot.bytes.length / 1024).toFixed(0)} KiB${pngNote}，落在 ${file.pathname.replace(/^\/(\w:)/, '$1')}`,
+  );
 
   console.log('SMOKE PASS');
 }

@@ -84,7 +84,8 @@ function build(
     capture: async (target) => {
       calls.captures.push(target);
       const result: ScreenshotResult = {
-        png: pngBytes(),
+        bytes: pngBytes(),
+        format: 'png',
         width: 800,
         height: 600,
         via: 'printwindow',
@@ -227,21 +228,47 @@ describe('Presence World', () => {
     expect(out.text).toContain('没在看着桌面');
   });
 
-  it('presence_screenshot：默认全屏，PNG 进 blobs，模型不吃图时把话说破', async () => {
+  it('presence_screenshot：默认截前台（不是全屏），PNG 进 blobs，模型不吃图时把话说破', async () => {
     const { world, tools, calls } = build();
     const host = new FakeHost();
     await world.start(host);
     const out = await call(tools.presence_screenshot, {});
-    expect(calls.captures[0]).toEqual({ target: 'full' });
+    expect(calls.captures[0]).toEqual({ target: 'foreground' });
     expect(out.failed).toBeUndefined();
     const blob = out.blobs?.[0] as { mime: string; bytes: Uint8Array; fallbackText: string };
     expect(blob.mime).toBe('image/png');
     expect(Buffer.from(blob.bytes).subarray(0, 4)).toEqual(pngBytes().subarray(0, 4));
     expect(blob.fallbackText).toContain('800x600');
     expect(out.text).toContain('当前模型配置不吃图'); // FakeHost 的 modelFacts.accepts 恒为 false
+    // 图是临时的这件事必须在回执里说破
+    expect(out.text).toContain('临时的');
+    expect(out.text).toContain('写成文字');
   });
 
-  it('presence_screenshot：能吃图时不说丧气话；hwnd 与 foreground 都落到对的目标', async () => {
+  it('presence_screenshot：JPEG 走 image/jpeg，回执里说明压过；第 2 张起提到更省的窗口列表', async () => {
+    const { world, tools } = build({
+      capture: async () => ({
+        bytes: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]),
+        format: 'jpeg' as const,
+        width: 1600,
+        height: 900,
+        via: 'screen' as const,
+        title: '视频窗口',
+      }),
+    });
+    const host = new FakeHost();
+    host.modelFacts.accepts = () => true;
+    await world.start(host);
+    const first = await call(tools.presence_screenshot, { target: 'full' });
+    expect((first.blobs?.[0] as { mime: string } | undefined)?.mime).toBe('image/jpeg');
+    expect(first.text).toContain('JPEG');
+    expect(first.text).not.toContain('第 2 张');
+    const second = await call(tools.presence_screenshot, {});
+    expect(second.text).toContain('第 2 张');
+    expect(second.text).toContain('presence_windows');
+  });
+
+  it('presence_screenshot：能吃图时不说丧气话；hwnd 与 full 都落到对的目标', async () => {
     const { world, tools, calls } = build();
     const host = new FakeHost();
     host.modelFacts.accepts = () => true;
@@ -249,11 +276,11 @@ describe('Presence World', () => {
     const ok = await call(tools.presence_screenshot, {});
     expect(ok.text).not.toContain('不吃图');
     await call(tools.presence_screenshot, { hwnd: 22 });
-    await call(tools.presence_screenshot, { target: 'foreground' });
+    await call(tools.presence_screenshot, { target: 'full' });
     expect(calls.captures).toEqual([
-      { target: 'full' },
-      { target: 'window', hwnd: 22 },
       { target: 'foreground' },
+      { target: 'window', hwnd: 22 },
+      { target: 'full' },
     ]);
   });
 

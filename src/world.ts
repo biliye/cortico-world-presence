@@ -99,6 +99,8 @@ export class PresenceWorld implements World {
   private ambientTimer: ReturnType<typeof setTimeout> | null = null;
   /** 她上次用 presence_windows 看是什么时候，变化段的「距你上次看」从这里算。 */
   private lastPeekAt = 0;
+  /** 本次运行截了几张图。第 2 张起在回执里提一句成本，给她一个省着用的抓手。 */
+  private shotCount = 0;
 
   constructor(private readonly opts: PresenceWorldOptions) {}
 
@@ -361,9 +363,10 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_screenshot',
       description:
-        'Take a screenshot and attach it as an image. target: "full" (all monitors stitched, default), ' +
-        '"foreground" (active window only), or pass a hwnd from presence_windows to capture that window. ' +
-        'Only call this when you actually want to look; screenshots go out with the model request.',
+        'Take a screenshot and attach it as an image. target: "foreground" (the active window, default), ' +
+        '"full" (all monitors stitched), or pass a hwnd from presence_windows to capture that window. ' +
+        'Only call this when you actually want to look; the picture rides along with every later request until ' +
+        'it falls out of your context. For "what is he doing" over time, presence_windows is far cheaper.',
       tags: ['read'],
       parameters: {
         type: 'object',
@@ -371,8 +374,8 @@ export class PresenceWorld implements World {
         properties: {
           target: {
             type: 'string',
-            enum: ['full', 'foreground'],
-            description: 'full = 全部显示器拼一张（默认）；foreground = 只截当前前台窗口。',
+            enum: ['foreground', 'full'],
+            description: 'foreground = 只截当前前台窗口（默认）；full = 全部显示器拼一张。',
           },
           hwnd: {
             type: 'integer',
@@ -385,40 +388,52 @@ export class PresenceWorld implements World {
   }
 
   private async takeScreenshot(args: Record<string, unknown>): Promise<ToolOutcome> {
+    // 默认前台窗口：整屏拼图既多暴露又多像素，而她真正要看的多半就是当前那个窗。
     const target: ScreenshotTarget =
       typeof args.hwnd === 'number' && Number.isFinite(args.hwnd) && args.hwnd > 0
         ? { target: 'window', hwnd: args.hwnd }
-        : args.target === 'foreground'
-          ? { target: 'foreground' }
-          : { target: 'full' };
+        : args.target === 'full'
+          ? { target: 'full' }
+          : { target: 'foreground' };
 
     let result: ScreenshotResult;
     try {
       const capture = this.opts.capture ?? ((t: ScreenshotTarget) => captureScreenshot(t, CAPTURE_TIMEOUT_MS));
       result = await capture(target);
     } catch (err) {
-      return fail(`截不了：${describe(err)}`);
+      const hint = target.target === 'foreground' ? '（不想截前台、就想硬截一下屏幕的话，传 target:"full"。）' : '';
+      return fail(`截不了：${describe(err)}${hint}`);
     }
 
+    this.shotCount += 1;
     const what =
       target.target === 'full'
         ? '全屏（所有显示器）'
         : `窗口「${result.title || (target.target === 'foreground' ? '前台' : String(target.hwnd))}」`;
     const viaText = result.via === 'printwindow' ? '画面来自窗口自己绘的帧' : '画面来自抓屏（被遮挡时会叠着别的窗口）';
-    const fallbackText = `[截图：${what} ${result.width}x${result.height}]`;
+    const formatText = result.format === 'jpeg' ? '，照片类画面已按 JPEG 压过' : '';
+    const mime = result.format === 'jpeg' ? 'image/jpeg' : 'image/png';
+    const kb = Math.round(result.bytes.length / 1024);
+    const fallbackText = `[截图：${what} ${result.width}x${result.height} ${result.format.toUpperCase()} ${kb}KiB]`;
 
     // 模型吃不吃图由宿主的 modelFacts 说了算；不吃就把话说破，别让她以为看见了。
-    let text = `已截${what}：${result.width}x${result.height}，${viaText}。画面附在本回执里。`;
-    if (this.host && !this.host.modelFacts.accepts('image/png')) {
+    let text =
+      `已截${what}：${result.width}x${result.height}，${kb} KiB${formatText}，${viaText}。画面附在本回执里。` +
+      '这张图是临时的：它会一直跟着你的上下文走，每一轮请求都重发一遍，直到被挤出去；' +
+      '看完要紧的东西就写成文字，图掉了你手里还有那行字。';
+    if (this.shotCount > 1) {
+      text += `（这是本次运行第 ${this.shotCount} 张。想接着看他在干什么，用 presence_windows 更省。）`;
+    }
+    if (this.host && !this.host.modelFacts.accepts(mime)) {
       text += '当前模型配置不吃图，你只能看到这行文字说明，看不到画面本身。';
     }
     return {
       text,
       blobs: [
         {
-          bytes: result.png,
-          mime: 'image/png',
-          name: `presence-${Date.now()}.png`,
+          bytes: result.bytes,
+          mime,
+          name: `presence-${Date.now()}.${result.format === 'jpeg' ? 'jpg' : 'png'}`,
           fallbackText,
         },
       ],

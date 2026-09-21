@@ -5,10 +5,20 @@
  */
 import { spawn } from 'node:child_process';
 
-/** 全屏拼图的最长边（像素），超过就等比降采样。再大只是烧 token。 */
+/** 截图的最长边（像素），超过就等比降采样。再大只是烧 token。 */
 export const SCREENSHOT_MAX_EDGE = 1600;
 /** 列窗口的回执上限，防一个挤满资源管理器窗口的桌面把 token 吃光。 */
 export const WINDOW_LIST_CAP = 100;
+/**
+ * 照片类画面的判定线：PNG 字节数 ÷ 像素数超过这个值，说明 PNG 压不动（画面里有视频、
+ * 照片、大片渐变），改存 JPEG。
+ *
+ * 实测两个端点：文字界面（ZCode 窗口 1203x773）是 0.10 字节/像素；浏览器里放着视频的
+ * 窗口（1600x870）是 1.21 字节/像素——差一个数量级，中间留得很宽。阈值取 0.5。
+ */
+export const PHOTO_BYTES_PER_PIXEL = 0.5;
+/** 转 JPEG 时的质量。80 是肉眼与体积的常规平衡点。 */
+export const JPEG_QUALITY = 80;
 
 export type ScreenshotTarget =
   | { target: 'full' }
@@ -16,7 +26,9 @@ export type ScreenshotTarget =
   | { target: 'window'; hwnd: number };
 
 export interface ScreenshotResult {
-  png: Buffer;
+  bytes: Buffer;
+  /** 实际编码：文字界面存 PNG（无损、字清楚），照片类画面存 JPEG（体积差一个数量级）。 */
+  format: 'png' | 'jpeg';
   width: number;
   height: number;
   /** 走的哪条路：`screen`（抓屏）或 `printwindow`（向窗口要画面）。 */
@@ -88,6 +100,24 @@ function captureScript(target: ScreenshotTarget): string {
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 function Out-Json($obj) { $obj | ConvertTo-Json -Compress -Depth 5 | Write-Output }
+# 把位图编码成 JPEG。先铺一层白底再画，免得带 alpha 的窗口在 JPEG 里变成黑块。
+function Get-JpegBytes($bitmap) {
+  $flat = New-Object System.Drawing.Bitmap -ArgumentList $bitmap.Width, $bitmap.Height, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+  $g = [System.Drawing.Graphics]::FromImage($flat)
+  $g.Clear([System.Drawing.Color]::White)
+  $g.DrawImage($bitmap, 0, 0, $bitmap.Width, $bitmap.Height)
+  $g.Dispose()
+  $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+  $params = New-Object System.Drawing.Imaging.EncoderParameters 1
+  $params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality), ${JPEG_QUALITY}
+  $ms = New-Object System.IO.MemoryStream
+  $flat.Save($ms, $codec, $params)
+  $out = $ms.ToArray()
+  $ms.Dispose()
+  $flat.Dispose()
+  return $out
+}
+
 try {
   Add-Type -AssemblyName System.Windows.Forms | Out-Null
   Add-Type -AssemblyName System.Drawing | Out-Null
@@ -187,12 +217,24 @@ public static class PresenceCap {
   }
   $ow = $src.Width
   $oh = $src.Height
-  $ms = New-Object System.IO.MemoryStream
-  $src.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+  $pngMs = New-Object System.IO.MemoryStream
+  $src.Save($pngMs, [System.Drawing.Imaging.ImageFormat]::Png)
+  $pngBytes = $pngMs.ToArray()
+  $pngMs.Dispose()
+  # 照片类画面（视频、照片、大片渐变）PNG 压不动，字节数会比像素数还大；那种画面转 JPEG，
+  # 体积差一个数量级。文字界面 PNG 压得很好，保持无损，字才清楚。
+  $pixels = [Math]::Max(1, $ow * $oh)
+  $ratio = $pngBytes.Length / $pixels
+  if ($ratio -gt ${PHOTO_BYTES_PER_PIXEL}) {
+    $bytes = Get-JpegBytes $src
+    $format = 'jpeg'
+  } else {
+    $bytes = $pngBytes
+    $format = 'png'
+  }
   $src.Dispose()
-  $b64 = [Convert]::ToBase64String($ms.ToArray())
-  $ms.Dispose()
-  Out-Json @{ ok = $true; png = $b64; width = $ow; height = $oh; via = $via; title = $title }
+  $b64 = [Convert]::ToBase64String($bytes)
+  Out-Json @{ ok = $true; data = $b64; format = $format; bytes = $bytes.Length; pngBytes = $pngBytes.Length; width = $ow; height = $oh; via = $via; title = $title }
 } catch {
   Out-Json @{ ok = $false; error = $_.Exception.Message }
 }
@@ -256,18 +298,32 @@ function asBuffer(value: unknown): Buffer {
   return Buffer.from(value, 'base64');
 }
 
+/** 校验编码：PNG 看魔数，JPEG 看 FFD8FF。截到的字节对不上就是没截成。 */
+function checkMagic(bytes: Buffer, format: 'png' | 'jpeg'): void {
+  if (format === 'png') {
+    const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    if (bytes.length < 8 || !bytes.subarray(0, 8).equals(magic)) {
+      throw new Error('截到的不是一张有效的 PNG');
+    }
+    return;
+  }
+  if (bytes.length < 3 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) {
+    throw new Error('截到的不是一张有效的 JPEG');
+  }
+}
+
 /** 截一张。她说要才调用；失败抛错（World 转成失败回执），错误文案给人看。 */
 export async function captureScreenshot(target: ScreenshotTarget, timeoutMs = 20000): Promise<ScreenshotResult> {
   const result = await runPowerShellJson(captureScript(target), timeoutMs);
   if (result.ok !== true) {
     throw new Error(typeof result.error === 'string' ? result.error : '截图失败，原因不明');
   }
-  const png = asBuffer(result.png);
-  if (png.length < 8 || png.subarray(0, 8).toString('binary') !== '\x89PNG\r\n\x1a\n') {
-    throw new Error('截到的不是一张有效的 PNG');
-  }
+  const format: 'png' | 'jpeg' = result.format === 'jpeg' ? 'jpeg' : 'png';
+  const bytes = asBuffer(result.data);
+  checkMagic(bytes, format);
   return {
-    png,
+    bytes,
+    format,
     width: Number(result.width ?? 0),
     height: Number(result.height ?? 0),
     via: result.via === 'printwindow' ? 'printwindow' : 'screen',

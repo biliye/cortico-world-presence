@@ -5,12 +5,16 @@ import { captureScreenshot, listWindows } from '../src/capture.ts';
 const maybe = process.platform === 'win32' ? describe : describe.skip;
 
 maybe('截图与列窗口（真 PowerShell）', () => {
-  it('截一张全屏，是合法 PNG，尺寸为正', async () => {
+  it('截一张全屏，是合法 PNG 或 JPEG，尺寸为正', async () => {
     const shot = await captureScreenshot({ target: 'full' }, 25000);
     expect(shot.width).toBeGreaterThan(0);
     expect(shot.height).toBeGreaterThan(0);
     expect(shot.via).toBe('screen');
-    expect([...shot.png.subarray(0, 8)]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    if (shot.format === 'png') {
+      expect([...shot.bytes.subarray(0, 8)]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    } else {
+      expect([...shot.bytes.subarray(0, 3)]).toEqual([0xff, 0xd8, 0xff]);
+    }
   }, 30000);
 
   it('列窗口：至少列得出带标题的窗口', async () => {
