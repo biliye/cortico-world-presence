@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ToolCallContext, ToolDef, ToolOutcome } from 'cortico/core/types.ts';
 import { dryMountWorld } from 'cortico/extensions/dry-mount.ts';
-import type { ScreenshotResult, ScreenshotTarget, WindowInfo } from '../src/capture.ts';
+import type { ScreenshotResult, ScreenshotTarget, ScreenInfo, WindowInfo } from '../src/capture.ts';
 import { PRESENCE_DEFAULTS, type PresenceConfigSection } from '../src/config.ts';
 import { PRESENCE } from '../src/definition.ts';
 import type { PresenceSensor, SensorExit, SensorTick, SensorWindow } from '../src/sensor.ts';
@@ -70,16 +70,26 @@ function build(
   const sensor = new FakeSensor();
   const calls = { listWindows: 0, captures: [] as ScreenshotTarget[] };
   const windows: WindowInfo[] = [
-    { ...WIN_B, foreground: true, minimized: false },
-    { ...WIN_A, foreground: false, minimized: true },
+    { ...WIN_B, foreground: true, minimized: false, bounds: { x: 100, y: 50, width: 1200, height: 800 } },
+    { ...WIN_A, foreground: false, minimized: true, bounds: { x: 0, y: 0, width: 0, height: 0 } },
   ];
+  const screen: ScreenInfo = {
+    x: 0,
+    y: 0,
+    width: 2560,
+    height: 1440,
+    monitors: [
+      { index: 0, x: 0, y: 0, width: 2560, height: 1440, primary: true },
+      { index: 1, x: -1920, y: 200, width: 1920, height: 1080, primary: false },
+    ],
+  };
   const world = new PresenceWorld({
     cfg: { ...PRESENCE_DEFAULTS, ...cfgPatch },
     timezone: 'Asia/Shanghai',
     spawnSensor: () => sensor,
     listWindows: async () => {
       calls.listWindows += 1;
-      return windows;
+      return { windows, screen };
     },
     capture: async (target) => {
       calls.captures.push(target);
@@ -88,6 +98,11 @@ function build(
         format: 'png',
         width: 800,
         height: 600,
+        captured:
+          target.target === 'region'
+            ? { ...target.region }
+            : { x: 0, y: 0, width: 800, height: 600 },
+        downscaled: false,
         via: 'printwindow',
         title: '测试窗口',
       };
@@ -210,8 +225,8 @@ describe('Presence World', () => {
     sensor.tick(5000, WIN_B); // 一条变化，攒着
     const out = await call(tools.presence_windows);
     expect(out.failed).toBeUndefined();
-    expect(out.text).toContain('「main.ts - 编辑器」(code) ← 前台');
-    expect(out.text).toContain('「知乎 - Google Chrome」(chrome) （最小化）');
+    expect(out.text).toContain('「main.ts - 编辑器」(code) x=100 y=50 1200x800 ← 前台');
+    expect(out.text).toContain('「知乎 - Google Chrome」(chrome) （最小化，位置不可用）');
     expect(out.text).toContain('键鼠空闲：5 秒');
     expect(out.text).toContain('[变化]');
     expect(out.text).toContain('「main.ts - 编辑器」'); // 变化行内联
@@ -252,6 +267,8 @@ describe('Presence World', () => {
         format: 'jpeg' as const,
         width: 1600,
         height: 900,
+        captured: { x: 0, y: 0, width: 1600, height: 900 },
+        downscaled: false,
         via: 'screen' as const,
         title: '视频窗口',
       }),
@@ -282,6 +299,113 @@ describe('Presence World', () => {
       { target: 'window', hwnd: 22 },
       { target: 'full' },
     ]);
+  });
+
+  it('presence_windows：回执带屏幕几何与每窗口矩形，最小化的窗口不给位置', async () => {
+    const { world, host, sensor, tools } = build();
+    await world.start(host);
+    sensor.tick(100, WIN_B);
+    const out = await call(tools.presence_windows);
+    expect(out.text).toContain('虚拟屏 2560x1440');
+    expect(out.text).toContain('#0主 x=0 y=0 2560x1440');
+    expect(out.text).toContain('#1 x=-1920 y=200 1920x1080'); // 左屏是负坐标，得如实报
+    expect(out.text).toContain('「main.ts - 编辑器」(code) x=100 y=50 1200x800');
+    expect(out.text).toContain('「知乎 - Google Chrome」(chrome) （最小化，位置不可用）');
+    expect(out.text).not.toContain('x=0 y=0 0x0'); // 最小化的窗口不该出现假坐标
+  });
+
+  describe('presence_screenshot 的区域', () => {
+    it('给了 width/height 就按区域截，坐标原样传下去，回执说明是原始像素', async () => {
+      const { world, tools, calls } = build();
+      await world.start(new FakeHost());
+      const out = await call(tools.presence_screenshot, { x: 600, y: 300, width: 400, height: 200 });
+      expect(calls.captures[0]).toEqual({ target: 'region', region: { x: 600, y: 300, width: 400, height: 200 } });
+      expect(out.failed).toBeUndefined();
+      expect(out.text).toContain('区域 x=600 y=300 400x200');
+      expect(out.text).toContain('原始像素');
+    });
+
+    it('x/y 不给算 0', async () => {
+      const { world, tools, calls } = build();
+      await world.start(new FakeHost());
+      await call(tools.presence_screenshot, { width: 300, height: 150 });
+      expect(calls.captures[0]).toEqual({ target: 'region', region: { x: 0, y: 0, width: 300, height: 150 } });
+    });
+
+    it('框太小或尺寸非法就失败，并说清怎么改', async () => {
+      const { world, tools, calls } = build();
+      await world.start(new FakeHost());
+      const tiny = await call(tools.presence_screenshot, { width: 8, height: 8 });
+      expect(tiny.failed).toBe(true);
+      expect(tiny.text).toContain('至少 16 像素');
+      const bad = await call(tools.presence_screenshot, { width: -100, height: 50 });
+      expect(bad.failed).toBe(true);
+      expect(bad.text).toContain('至少 16 像素');
+      expect(calls.captures).toEqual([]); // 没通过校验就不该去截
+    });
+
+    it('区域被屏幕夹紧时在回执里说明实际抓的是哪一块', async () => {
+      const { world, tools } = build({
+        capture: async () => ({
+          bytes: pngBytes(),
+          format: 'png' as const,
+          width: 2560,
+          height: 100,
+          captured: { x: 2000, y: 0, width: 560, height: 100 }, // 右侧超出，被夹回
+          downscaled: false,
+          via: 'screen' as const,
+          title: '',
+        }),
+      });
+      await world.start(new FakeHost());
+      const out = await call(tools.presence_screenshot, { x: 2000, y: 0, width: 1400, height: 100 });
+      expect(out.text).toContain('有一部分在屏幕外，已夹到屏幕内');
+      expect(out.text).toContain('区域 x=2000 y=0 560x100');
+    });
+
+    it('区域超过上限被压过时提醒她框小一点', async () => {
+      const { world, tools } = build({
+        capture: async () => ({
+          bytes: pngBytes(),
+          format: 'png' as const,
+          width: 1600,
+          height: 1200,
+          captured: { x: 0, y: 0, width: 3000, height: 2000 },
+          downscaled: true,
+          via: 'screen' as const,
+          title: '',
+        }),
+      });
+      await world.start(new FakeHost());
+      const out = await call(tools.presence_screenshot, { width: 3000, height: 2000 });
+      expect(out.text).toContain('被压成了 1600x1200');
+      expect(out.text).toContain('框小一点');
+    });
+
+    it('同一块区域反复看：第一次说第一次，没变就说没变，变了就说有变化', async () => {
+      let payload = pngBytes();
+      const { world, tools } = build({
+        capture: async () => ({
+          bytes: payload,
+          format: 'png' as const,
+          width: 300,
+          height: 200,
+          captured: { x: 10, y: 20, width: 300, height: 200 },
+          downscaled: false,
+          via: 'screen' as const,
+          title: '',
+        }),
+      });
+      await world.start(new FakeHost());
+      const args = { x: 10, y: 20, width: 300, height: 200 };
+      const first = await call(tools.presence_screenshot, args);
+      expect(first.text).toContain('第一次看这块');
+      const same = await call(tools.presence_screenshot, args);
+      expect(same.text).toContain('像素级完全相同');
+      payload = Buffer.concat([pngBytes(), Buffer.from([1, 2, 3])]);
+      const changed = await call(tools.presence_screenshot, args);
+      expect(changed.text).toContain('有变化');
+    });
   });
 
   it('截图失败转成失败回执，不抛错', async () => {

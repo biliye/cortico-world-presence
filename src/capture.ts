@@ -1,13 +1,16 @@
 /**
  * 按需的一次性 PowerShell：截屏与列窗口。不走常驻传感器——她说要才发生，
- * 进程用完即退。回执里始终带 `via`（走的哪条路）与 `title`（截的是谁），
+ * 进程用完即退。回执里始终带 `via`（走的哪条路）与 `captured`（实际抓的区域），
  * 截不了就报错原因，不返黑图装成功。
+ *
+ * 坐标一律是**物理像素**、**虚拟屏坐标**（主屏左上为原点，主屏左边的显示器是负坐标）。
+ * 这两个脚本开头都声明 DPI 感知，所以上报的窗口矩形与区域坐标同一个坐标系。
  */
 import { spawn } from 'node:child_process';
 
 /** 截图的最长边（像素），超过就等比降采样。再大只是烧 token。 */
 export const SCREENSHOT_MAX_EDGE = 1600;
-/** 列窗口的回执上限，防一个挤满资源管理器窗口的桌面把 token 吃光。 */
+/** 列窗口的枚举上限（也等于回执上限），防一个挤满窗口的桌面把 token 吃光。 */
 export const WINDOW_LIST_CAP = 100;
 /**
  * 照片类画面的判定线：PNG 字节数 ÷ 像素数超过这个值，说明 PNG 压不动（画面里有视频、
@@ -19,11 +22,21 @@ export const WINDOW_LIST_CAP = 100;
 export const PHOTO_BYTES_PER_PIXEL = 0.5;
 /** 转 JPEG 时的质量。80 是肉眼与体积的常规平衡点。 */
 export const JPEG_QUALITY = 80;
+/** 区域的最小边：太小的框截出来没意义，还会让她以为是程序坏了。 */
+export const REGION_MIN_EDGE = 16;
+
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
 export type ScreenshotTarget =
   | { target: 'full' }
   | { target: 'foreground' }
-  | { target: 'window'; hwnd: number };
+  | { target: 'window'; hwnd: number }
+  | { target: 'region'; region: Rect };
 
 export interface ScreenshotResult {
   bytes: Buffer;
@@ -31,10 +44,26 @@ export interface ScreenshotResult {
   format: 'png' | 'jpeg';
   width: number;
   height: number;
+  /** 实际抓的区域。region 目标下会被虚拟屏夹紧，所以可能和你框的不一样。 */
+  captured: Rect;
+  /**
+   * 抓到的像素比实际区域小（框的长边超过上限被压过）。**小字会糊**——看到这个就框小一点，
+   * 框小反而清楚，因为小框不会走降采样。
+   */
+  downscaled: boolean;
   /** 走的哪条路：`screen`（抓屏）或 `printwindow`（向窗口要画面）。 */
   via: 'screen' | 'printwindow';
-  /** 目标窗口的标题；全屏时为空。 */
+  /** 目标窗口的标题；全屏与区域时为空。 */
   title: string;
+}
+
+export interface MonitorInfo {
+  index: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  primary: boolean;
 }
 
 export interface WindowInfo {
@@ -44,6 +73,22 @@ export interface WindowInfo {
   pid: number;
   foreground: boolean;
   minimized: boolean;
+  /** 窗口矩形，物理像素、虚拟屏坐标。最小化的窗口没有可用位置，四个值都是 0。 */
+  bounds: Rect;
+}
+
+/** 屏幕几何：虚拟屏（所有显示器拼起来的范围）加每台显示器。 */
+export interface ScreenInfo {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  monitors: MonitorInfo[];
+}
+
+export interface WindowList {
+  windows: WindowInfo[];
+  screen: ScreenInfo;
 }
 
 const POWER_SHELL_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'];
@@ -92,14 +137,18 @@ function runPowerShellJson(script: string, timeoutMs: number): Promise<Record<st
   });
 }
 
-/** 截屏脚本。target 与 hwnd 是模板里插进去的常量；出错输出 `{ok:false,error}`，不抛裸栈。 */
+/** 截屏脚本。target 与区域坐标是模板里插进去的常量；出错输出 `{ok:false,error}`，不抛裸栈。 */
 function captureScript(target: ScreenshotTarget): string {
   const kind = target.target;
   const hwnd = target.target === 'window' ? String(Math.trunc(target.hwnd)) : '0';
+  const rx = target.target === 'region' ? String(Math.trunc(target.region.x)) : '0';
+  const ry = target.target === 'region' ? String(Math.trunc(target.region.y)) : '0';
+  const rw = target.target === 'region' ? String(Math.trunc(target.region.width)) : '0';
+  const rh = target.target === 'region' ? String(Math.trunc(target.region.height)) : '0';
   return `
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-function Out-Json($obj) { $obj | ConvertTo-Json -Compress -Depth 5 | Write-Output }
+function Out-Json($obj) { $obj | ConvertTo-Json -Compress -Depth 6 | Write-Output }
 # 把位图编码成 JPEG。先铺一层白底再画，免得带 alpha 的窗口在 JPEG 里变成黑块。
 function Get-JpegBytes($bitmap) {
   $flat = New-Object System.Drawing.Bitmap -ArgumentList $bitmap.Width, $bitmap.Height, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
@@ -146,11 +195,23 @@ public static class PresenceCap {
   $title = ''
   $rect = $null
   $h = [IntPtr]::Zero
+  $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  if ($vs.Width -le 0 -or $vs.Height -le 0) { throw '拿不到屏幕尺寸' }
 
   if ($kind -eq 'full') {
-    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
-    if ($vs.Width -le 0 -or $vs.Height -le 0) { throw '拿不到屏幕尺寸' }
     $rect = @{ x = $vs.Left; y = $vs.Top; w = $vs.Width; h = $vs.Height }
+  } elseif ($kind -eq 'region') {
+    # 按虚拟屏夹紧:她框到屏幕外面时不算错，夹回来并在回执里说清实际抓的是哪一块。
+    $cl = [Math]::Max(${rx}, $vs.Left)
+    $ct = [Math]::Max(${ry}, $vs.Top)
+    $cr = [Math]::Min(${rx} + ${rw}, $vs.Left + $vs.Width)
+    $cb = [Math]::Min(${ry} + ${rh}, $vs.Top + $vs.Height)
+    $cw = $cr - $cl
+    $chh = $cb - $ct
+    if ($cw -le 0 -or $chh -le 0) {
+      throw "这块区域不在屏幕上。虚拟屏范围:x=$($vs.Left) y=$($vs.Top) 宽=$($vs.Width) 高=$($vs.Height)"
+    }
+    $rect = @{ x = $cl; y = $ct; w = $cw; h = $chh }
   } else {
     if ($kind -eq 'foreground') {
       $h = [PresenceCap]::GetForegroundWindow()
@@ -177,13 +238,7 @@ public static class PresenceCap {
 
   $via = ''
   $src = $null
-  if ($kind -eq 'full') {
-    $src = New-Object System.Drawing.Bitmap -ArgumentList $rect.w, $rect.h
-    $g = [System.Drawing.Graphics]::FromImage($src)
-    [void]$g.CopyFromScreen($rect.x, $rect.y, 0, 0, (New-Object System.Drawing.Size -ArgumentList $rect.w, $rect.h))
-    $g.Dispose()
-    $via = 'screen'
-  } else {
+  if ($kind -eq 'window') {
     $src = New-Object System.Drawing.Bitmap -ArgumentList $rect.w, $rect.h
     $g = [System.Drawing.Graphics]::FromImage($src)
     $hdc = $g.GetHdc()
@@ -194,16 +249,20 @@ public static class PresenceCap {
       $via = 'printwindow'
     } else {
       $src.Dispose()
-      $src = New-Object System.Drawing.Bitmap -ArgumentList $rect.w, $rect.h
-      $g2 = [System.Drawing.Graphics]::FromImage($src)
-      [void]$g2.CopyFromScreen($rect.x, $rect.y, 0, 0, (New-Object System.Drawing.Size -ArgumentList $rect.w, $rect.h))
-      $g2.Dispose()
-      $via = 'screen'
+      $src = $null
     }
+  }
+  if ($null -eq $src) {
+    $src = New-Object System.Drawing.Bitmap -ArgumentList $rect.w, $rect.h
+    $g = [System.Drawing.Graphics]::FromImage($src)
+    [void]$g.CopyFromScreen($rect.x, $rect.y, 0, 0, (New-Object System.Drawing.Size -ArgumentList $rect.w, $rect.h))
+    $g.Dispose()
+    $via = 'screen'
   }
 
   $edge = [Math]::Max($src.Width, $src.Height)
-  if ($edge -gt $maxEdge) {
+  $downscaled = $edge -gt $maxEdge
+  if ($downscaled) {
     $scale = $maxEdge / $edge
     $nw = [Math]::Max(1, [int][Math]::Round($src.Width * $scale))
     $nh = [Math]::Max(1, [int][Math]::Round($src.Height * $scale))
@@ -234,33 +293,51 @@ public static class PresenceCap {
   }
   $src.Dispose()
   $b64 = [Convert]::ToBase64String($bytes)
-  Out-Json @{ ok = $true; data = $b64; format = $format; bytes = $bytes.Length; pngBytes = $pngBytes.Length; width = $ow; height = $oh; via = $via; title = $title }
+  $captured = @{ x = $rect.x; y = $rect.y; width = $rect.w; height = $rect.h }
+  Out-Json @{ ok = $true; data = $b64; format = $format; bytes = $bytes.Length; width = $ow; height = $oh; captured = $captured; downscaled = $downscaled; via = $via; title = $title }
 } catch {
   Out-Json @{ ok = $false; error = $_.Exception.Message }
 }
 `.trim();
 }
 
-/** 列可见顶层窗口（跳过披隐藏斗篷的 UWP 壳），标出前台与最小化。 */
+/** 列可见顶层窗口（跳过披隐藏斗篷的 UWP 壳），带上矩形；同时报屏幕几何。 */
 function listWindowsScript(): string {
   return `
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class PresenceList {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
   public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc callback, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, ref RECT rect);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int sizeOfValue);
 }
 '@
+# 窗口外框尺寸走 DWM(9 = EXTENDED_FRAME_BOUNDS)，拿到的是不含投影的真实边界。
+# 与上面那个 out int 的重载同名，所以另起一个托管类、用 EntryPoint 指回同一个入口。
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PresenceFrame {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+  [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")] public static extern int Frame(IntPtr hwnd, int attribute, out RECT rect, int sizeOfRect);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
+}
+'@
+try { [void][PresenceFrame]::SetProcessDpiAwareness(2) } catch { try { [void][PresenceFrame]::SetProcessDPIAware() } catch {} }
+
 $fg = [PresenceList]::GetForegroundWindow()
 $found = New-Object System.Collections.ArrayList
 $cap = ${WINDOW_LIST_CAP}
@@ -278,18 +355,48 @@ $callback = [PresenceList+EnumProc]{
   $procId = [uint32]0
   [void][PresenceList]::GetWindowThreadProcessId($h, [ref]$procId)
   $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+  $minimized = [PresenceList]::IsIconic($h)
+  # 最小化的窗口没有可用位置（GetWindowRect 给的是 -32000 那种哨兵值），
+  # 报上去只会让她算出没用的坐标，所以四个值给 0，由回执标「最小化」。
+  $bx = 0; $by = 0; $bw = 0; $bh = 0
+  if (-not $minimized) {
+    $r = New-Object 'PresenceFrame+RECT'
+    $hr = [PresenceFrame]::Frame($h, 9, [ref]$r, [System.Runtime.InteropServices.Marshal]::SizeOf($r))
+    if ($hr -ne 0 -or ($r.Right - $r.Left) -le 0) {
+      $r = New-Object 'PresenceFrame+RECT'
+      [void][PresenceList]::GetWindowRect($h, [ref]$r)
+    }
+    $bx = $r.Left; $by = $r.Top; $bw = $r.Right - $r.Left; $bh = $r.Bottom - $r.Top
+  }
   [void]$found.Add(@{
     hwnd = $h.ToInt64()
     title = $t
     exe = $(if ($p) { $p.ProcessName } else { '' })
     pid = $procId
     foreground = ($h -eq $fg)
-    minimized = [PresenceList]::IsIconic($h)
+    minimized = $minimized
+    bounds = @{ x = $bx; y = $by; width = $bw; height = $bh }
   })
   return $true
 }
 [void][PresenceList]::EnumWindows($callback, [IntPtr]::Zero)
-@{ ok = $true; windows = $found } | ConvertTo-Json -Compress -Depth 5 | Write-Output
+
+$vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$mons = New-Object System.Collections.ArrayList
+$i = 0
+foreach ($s in [System.Windows.Forms.Screen]::AllScreens) {
+  [void]$mons.Add(@{
+    index = $i
+    x = $s.Bounds.Left
+    y = $s.Bounds.Top
+    width = $s.Bounds.Width
+    height = $s.Bounds.Height
+    primary = $s.Primary
+  })
+  $i = $i + 1
+}
+$screen = @{ x = $vs.Left; y = $vs.Top; width = $vs.Width; height = $vs.Height; monitors = $mons }
+@{ ok = $true; windows = $found; screen = $screen } | ConvertTo-Json -Compress -Depth 6 | Write-Output
 `.trim();
 }
 
@@ -312,6 +419,37 @@ function checkMagic(bytes: Buffer, format: 'png' | 'jpeg'): void {
   }
 }
 
+function toRect(raw: unknown): Rect {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  return {
+    x: Math.round(Number(r.x ?? 0)) || 0,
+    y: Math.round(Number(r.y ?? 0)) || 0,
+    width: Math.max(0, Math.round(Number(r.width ?? 0)) || 0),
+    height: Math.max(0, Math.round(Number(r.height ?? 0)) || 0),
+  };
+}
+
+/**
+ * 校验她框的区域。返回矩形或一句人话的错误。
+ * 只做形状校验:是否落在屏幕上是 PowerShell 那边的事（夹紧或报错）。
+ */
+export function parseRegion(args: Record<string, unknown>): Rect | string {
+  const num = (v: unknown): number | null => {
+    if (typeof v === 'number' && Number.isFinite(v)) return Math.round(v);
+    if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Math.round(Number(v));
+    return null;
+  };
+  const width = num(args.width);
+  const height = num(args.height);
+  if (width === null || height === null) return '截区域要同时给 width 和 height（物理像素）。';
+  if (width < REGION_MIN_EDGE || height < REGION_MIN_EDGE) {
+    return `框太小了（${width}x${height}）：宽高都至少 ${REGION_MIN_EDGE} 像素。`;
+  }
+  const x = num(args.x) ?? 0;
+  const y = num(args.y) ?? 0;
+  return { x, y, width, height };
+}
+
 /** 截一张。她说要才调用；失败抛错（World 转成失败回执），错误文案给人看。 */
 export async function captureScreenshot(target: ScreenshotTarget, timeoutMs = 20000): Promise<ScreenshotResult> {
   const result = await runPowerShellJson(captureScript(target), timeoutMs);
@@ -326,26 +464,43 @@ export async function captureScreenshot(target: ScreenshotTarget, timeoutMs = 20
     format,
     width: Number(result.width ?? 0),
     height: Number(result.height ?? 0),
+    captured: toRect(result.captured),
+    downscaled: result.downscaled === true,
     via: result.via === 'printwindow' ? 'printwindow' : 'screen',
     title: typeof result.title === 'string' ? result.title : '',
   };
 }
 
-/** 列一遍可见窗口。失败抛错。 */
-export async function listWindows(timeoutMs = 15000): Promise<WindowInfo[]> {
+/** 一个对象也可能是 ConvertTo-Json 把单元素数组拍平的结果，兜一下。 */
+function asArray<T>(value: unknown): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (value === null || value === undefined) return [];
+  return [value as T];
+}
+
+/** 列一遍可见窗口，附带屏幕几何。失败抛错。 */
+export async function listWindows(timeoutMs = 15000): Promise<WindowList> {
   const result = await runPowerShellJson(listWindowsScript(), timeoutMs);
-  if (result.ok !== true || !Array.isArray(result.windows)) {
+  if (result.ok !== true) {
     throw new Error(typeof result.error === 'string' ? result.error : '列不出窗口');
   }
-  return result.windows.map((raw) => {
-    const w = raw as Record<string, unknown>;
-    return {
-      hwnd: Number(w.hwnd ?? 0),
-      title: typeof w.title === 'string' ? w.title : '',
-      exe: typeof w.exe === 'string' ? w.exe : '',
-      pid: Number(w.pid ?? 0),
-      foreground: w.foreground === true,
-      minimized: w.minimized === true,
-    };
-  });
+  const windows = asArray<Record<string, unknown>>(result.windows).map((w) => ({
+    hwnd: Number(w.hwnd ?? 0),
+    title: typeof w.title === 'string' ? w.title : '',
+    exe: typeof w.exe === 'string' ? w.exe : '',
+    pid: Number(w.pid ?? 0),
+    foreground: w.foreground === true,
+    minimized: w.minimized === true,
+    bounds: toRect(w.bounds),
+  }));
+  const rawScreen = (result.screen ?? {}) as Record<string, unknown>;
+  const screen: ScreenInfo = {
+    ...toRect(rawScreen),
+    monitors: asArray<Record<string, unknown>>(rawScreen.monitors).map((m, index) => ({
+      index: Number(m.index ?? index),
+      ...toRect(m),
+      primary: m.primary === true,
+    })),
+  };
+  return { windows, screen };
 }

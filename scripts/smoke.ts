@@ -30,15 +30,20 @@ async function main(): Promise<void> {
     `  采到 ${ticks.length} 轮。前台：${last.cur ? `「${last.cur.title}」(${last.cur.exe})` : '(无)'}，键鼠空闲 ${(last.idleMs / 1000).toFixed(1)} 秒。`,
   );
 
-  console.log('[2/3] 列窗口……');
-  const windows = await listWindows();
-  console.log(`  可见窗口 ${windows.length} 个，前台：${windows.find((w) => w.foreground)?.title ?? '(无)'}`);
-  for (const w of windows.slice(0, 5)) {
-    console.log(`    - 「${w.title}」(${w.exe})${w.minimized ? '（最小化）' : ''}`);
+  console.log('[2/4] 列窗口 + 屏幕几何……');
+  const listed = await listWindows();
+  const fg = listed.windows.find((w) => w.foreground);
+  console.log(
+    `  虚拟屏 x=${listed.screen.x} y=${listed.screen.y} ${listed.screen.width}x${listed.screen.height}，` +
+      `${listed.screen.monitors.length} 台显示器；可见窗口 ${listed.windows.length} 个，前台：${fg?.title ?? '(无)'}`,
+  );
+  for (const w of listed.windows.slice(0, 5)) {
+    const rect = w.minimized ? '（最小化，无位置）' : `x=${w.bounds.x} y=${w.bounds.y} ${w.bounds.width}x${w.bounds.height}`;
+    console.log(`    - 「${w.title}」(${w.exe}) ${rect}`);
   }
-  if (windows.length > 5) console.log(`    …还有 ${windows.length - 5} 个`);
+  if (listed.windows.length > 5) console.log(`    …还有 ${listed.windows.length - 5} 个`);
 
-  console.log('[3/3] 截一张全屏……');
+  console.log('[3/4] 截一张全屏……');
   const shot = await captureScreenshot({ target: 'full' });
   const ext = shot.format === 'jpeg' ? 'jpg' : 'png';
   const file = new URL(`../presence-smoke.${ext}`, import.meta.url);
@@ -46,6 +51,23 @@ async function main(): Promise<void> {
   const pngNote = shot.format === 'jpeg' ? `（PNG 本会是更大的体积，已按照片类画面压成 JPEG）` : '';
   console.log(
     `  ${shot.width}x${shot.height}，${shot.format.toUpperCase()} ${(shot.bytes.length / 1024).toFixed(0)} KiB${pngNote}，落在 ${file.pathname.replace(/^\/(\w:)/, '$1')}`,
+  );
+
+  // 「盯一块看变化」的实际成本：框一小块反复截，每次就是这么点字节。
+  console.log('[4/4] 截一小块区域（前台窗口左上角 480x180，通常带标题/工具条的小字）……');
+  const baseX = fg && !fg.minimized && fg.bounds.width > 480 ? fg.bounds.x : listed.screen.x;
+  const baseY = fg && !fg.minimized && fg.bounds.height > 180 ? fg.bounds.y : listed.screen.y;
+  const region = await captureScreenshot({
+    target: 'region',
+    region: { x: baseX, y: baseY, width: 480, height: 180 },
+  });
+  const regionFile = new URL('../presence-smoke-region.png', import.meta.url);
+  writeFileSync(regionFile, region.bytes);
+  const ratio = region.bytes.length / (shot.bytes.length || 1);
+  console.log(
+    `  框 x=${region.captured.x} y=${region.captured.y} ${region.captured.width}x${region.captured.height}，` +
+      `${region.width}x${region.height} ${region.format.toUpperCase()} ${(region.bytes.length / 1024).toFixed(0)} KiB，` +
+      `降采样=${region.downscaled ? '是' : '否'}，只有全屏那张的 ${(ratio * 100).toFixed(1)}%。`,
   );
 
   console.log('SMOKE PASS');

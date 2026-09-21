@@ -22,13 +22,17 @@ import type {
   WorldLamp,
 } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
+  SCREENSHOT_MAX_EDGE,
   captureScreenshot,
   listWindows,
+  parseRegion,
+  type Rect,
   type ScreenshotResult,
   type ScreenshotTarget,
-  type WindowInfo,
+  type WindowList,
 } from './capture.ts';
 import { PRESENCE_CONFIG_GROUP, type PresenceConfigSection } from './config.ts';
 import { spawnSensor, type PresenceSensor, type SensorTick, type SensorWindow } from './sensor.ts';
@@ -55,7 +59,7 @@ export interface PresenceWorldOptions {
   /** 测试用：换掉传感器。缺省拉 PowerShell。 */
   spawnSensor?: (pollIntervalMs: number) => PresenceSensor;
   /** 测试用：换掉列窗口。 */
-  listWindows?: () => Promise<WindowInfo[]>;
+  listWindows?: () => Promise<WindowList>;
   /** 测试用：换掉截图。 */
   capture?: (target: ScreenshotTarget) => Promise<ScreenshotResult>;
   /** 测试用：调小 ambient 攒批的字数上限。 */
@@ -101,6 +105,11 @@ export class PresenceWorld implements World {
   private lastPeekAt = 0;
   /** 本次运行截了几张图。第 2 张起在回执里提一句成本，给她一个省着用的抓手。 */
   private shotCount = 0;
+  /**
+   * 每块区域上次看到的样子（内容的 sha256）。她盯着一块反复看时，回执里能直接告诉她
+   * 「和上次一样 / 有变化」，不用她自己比对两张图。运行态、重启即忘。
+   */
+  private regionHashes = new Map<string, string>();
 
   constructor(private readonly opts: PresenceWorldOptions) {}
 
@@ -308,9 +317,10 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_windows',
       description:
-        'See what is on the screen right now: which window is in the foreground, keyboard/mouse idle time, ' +
-        'and the list of visible windows. Also delivers anything that accumulated since you last looked. ' +
-        'Use presence_screenshot when you need pixels instead of text.',
+        'See what is on the screen right now: the foreground window, keyboard/mouse idle time, the screen geometry ' +
+        '(virtual screen and each monitor, in physical pixels), and every visible window with its rectangle. ' +
+        'Those rectangles are what you pass to presence_screenshot to capture one spot. ' +
+        'Also delivers anything that accumulated since you last looked.',
       tags: ['read'],
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       handler: async (_args: Record<string, unknown>, _ctx: ToolCallContext) => this.renderWindows(),
@@ -321,12 +331,14 @@ export class PresenceWorld implements World {
     if (this.state !== 'watching') {
       return fail(`现在没在看着桌面${this.lastError ? `：${this.lastError}` : ''}。重启本 World 可以重开。`);
     }
-    let windows: WindowInfo[];
+    let listed: WindowList;
     try {
-      windows = this.opts.listWindows ? await this.opts.listWindows() : await listWindows();
+      listed = this.opts.listWindows ? await this.opts.listWindows() : await listWindows();
     } catch (err) {
       return fail(`列不出窗口：${describe(err)}`);
     }
+    const windows = listed.windows;
+    const screen = listed.screen;
 
     const now = Date.now();
     const idleText = this.idleMs < 0 ? '—' : fmtDuration(this.idleMs);
@@ -334,10 +346,20 @@ export class PresenceWorld implements World {
       `前台：「${this.current?.title || '（无前台窗口）'}」${this.current?.exe ? `(${this.current.exe})` : ''}`,
       `键鼠空闲：${idleText}（按最近一次轮询）`,
       `投递姿势：${this.delivery === 'call' ? 'call（即投，叫醒我）' : 'ambient（攒批，不叫醒我）'}`,
-      `可见窗口 ${windows.length} 个：`,
+      // 坐标空间先交代清楚，她才好自己框区域。
+      `坐标都是物理像素、虚拟屏坐标（原点在上面的 x=${screen.x} y=${screen.y}）；` +
+        `虚拟屏 ${screen.width}x${screen.height}，` +
+        `屏幕 ${screen.monitors.length} 台：` +
+        screen.monitors
+          .map((m) => `#${m.index}${m.primary ? '主' : ''} x=${m.x} y=${m.y} ${m.width}x${m.height}`)
+          .join('；'),
+      `可见窗口 ${windows.length} 个（带矩形 x,y 宽x高）：`,
       ...windows.slice(0, WINDOW_RECEIPT_CAP).map((w) => {
-        const marks = [w.foreground ? '← 前台' : '', w.minimized ? '（最小化）' : ''].filter(Boolean).join(' ');
-        return `- 「${w.title}」(${w.exe})${marks ? ` ${marks}` : ''}`;
+        const marks = [w.foreground ? '← 前台' : '', w.minimized ? '（最小化，位置不可用）' : '']
+          .filter(Boolean)
+          .join(' ');
+        const rect = w.minimized ? '' : ` x=${w.bounds.x} y=${w.bounds.y} ${w.bounds.width}x${w.bounds.height}`;
+        return `- 「${w.title}」(${w.exe})${rect}${marks ? ` ${marks}` : ''}`;
       }),
     ];
     if (windows.length > WINDOW_RECEIPT_CAP) lines.push(`（还有 ${windows.length - WINDOW_RECEIPT_CAP} 个没列）`);
@@ -363,23 +385,30 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_screenshot',
       description:
-        'Take a screenshot and attach it as an image. target: "foreground" (the active window, default), ' +
-        '"full" (all monitors stitched), or pass a hwnd from presence_windows to capture that window. ' +
-        'Only call this when you actually want to look; the picture rides along with every later request until ' +
-        'it falls out of your context. For "what is he doing" over time, presence_windows is far cheaper.',
+        'Take a screenshot and attach it as an image. Three ways to aim it, in this order of precedence: ' +
+        '(1) give x/y/width/height to capture exactly that region — use the rectangles from presence_windows; ' +
+        '(2) give a hwnd to capture that whole window; (3) give target "foreground" (default) or "full". ' +
+        'Regions under the size cap come back at native pixels, so a SMALL region is how you read small text: ' +
+        'framing tighter beats framing wider. Only call this when you actually want to look; the picture rides ' +
+        'along with every later request until it falls out of your context, so for "what is he doing" over time ' +
+        'presence_windows is far cheaper.',
       tags: ['read'],
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
+          x: { type: 'integer', description: '区域的左上角 x（物理像素，虚拟屏坐标）。不给算 0。' },
+          y: { type: 'integer', description: '区域的左上角 y（物理像素，虚拟屏坐标）。不给算 0。' },
+          width: { type: 'integer', description: '区域宽（物理像素，至少 16）。给了 width 与 height 就按区域截。' },
+          height: { type: 'integer', description: '区域高（物理像素，至少 16）。' },
+          hwnd: {
+            type: 'integer',
+            description: 'presence_windows 列出的窗口句柄；给了就截这个窗口整个（区域参数优先）。',
+          },
           target: {
             type: 'string',
             enum: ['foreground', 'full'],
             description: 'foreground = 只截当前前台窗口（默认）；full = 全部显示器拼一张。',
-          },
-          hwnd: {
-            type: 'integer',
-            description: 'presence_windows 列出的窗口句柄；给了就截这个窗口，忽略 target。',
           },
         },
       },
@@ -388,47 +417,92 @@ export class PresenceWorld implements World {
   }
 
   private async takeScreenshot(args: Record<string, unknown>): Promise<ToolOutcome> {
-    // 默认前台窗口：整屏拼图既多暴露又多像素，而她真正要看的多半就是当前那个窗。
-    const target: ScreenshotTarget =
-      typeof args.hwnd === 'number' && Number.isFinite(args.hwnd) && args.hwnd > 0
-        ? { target: 'window', hwnd: args.hwnd }
-        : args.target === 'full'
-          ? { target: 'full' }
-          : { target: 'foreground' };
+    // 优先级:区域（width+height）→ 指定窗口 hwnd → target（默认前台）。
+    // 默认前台而不是全屏:整屏拼图既多暴露又多像素，而她真正要看的多半就是当前那个窗口。
+    let target: ScreenshotTarget;
+    const wantsRegion = args.width !== undefined || args.height !== undefined;
+    if (wantsRegion) {
+      const region = parseRegion(args);
+      if (typeof region === 'string') return fail(region);
+      target = { target: 'region', region };
+    } else if (typeof args.hwnd === 'number' && Number.isFinite(args.hwnd) && args.hwnd > 0) {
+      target = { target: 'window', hwnd: args.hwnd };
+    } else if (args.target === 'full') {
+      target = { target: 'full' };
+    } else {
+      target = { target: 'foreground' };
+    }
 
     let result: ScreenshotResult;
     try {
       const capture = this.opts.capture ?? ((t: ScreenshotTarget) => captureScreenshot(t, CAPTURE_TIMEOUT_MS));
       result = await capture(target);
     } catch (err) {
-      const hint = target.target === 'foreground' ? '（不想截前台、就想硬截一下屏幕的话，传 target:"full"。）' : '';
+      const hint =
+        target.target === 'foreground' ? '（不想截前台、就想硬截一下屏幕的话，传 target:"full"。）' : '';
       return fail(`截不了：${describe(err)}${hint}`);
     }
 
     this.shotCount += 1;
+    const cap = result.captured;
     const what =
-      target.target === 'full'
-        ? '全屏（所有显示器）'
-        : `窗口「${result.title || (target.target === 'foreground' ? '前台' : String(target.hwnd))}」`;
-    const viaText = result.via === 'printwindow' ? '画面来自窗口自己绘的帧' : '画面来自抓屏（被遮挡时会叠着别的窗口）';
+      target.target === 'region'
+        ? `区域 x=${cap.x} y=${cap.y} ${cap.width}x${cap.height}`
+        : target.target === 'full'
+          ? '全屏（所有显示器）'
+          : `窗口「${result.title || (target.target === 'foreground' ? '前台' : String(target.hwnd))}」`;
+    const viaText =
+      target.target === 'region'
+        ? '截的是屏幕上这一块现在的样子（有窗口压在上面就会截到上面那个）'
+        : result.via === 'printwindow'
+          ? '画面来自窗口自己绘的帧'
+          : '画面来自抓屏（被遮挡时会叠着别的窗口）';
     const formatText = result.format === 'jpeg' ? '，照片类画面已按 JPEG 压过' : '';
     const mime = result.format === 'jpeg' ? 'image/jpeg' : 'image/png';
     const kb = Math.round(result.bytes.length / 1024);
     const fallbackText = `[截图：${what} ${result.width}x${result.height} ${result.format.toUpperCase()} ${kb}KiB]`;
 
-    // 模型吃不吃图由宿主的 modelFacts 说了算；不吃就把话说破，别让她以为看见了。
-    let text =
-      `已截${what}：${result.width}x${result.height}，${kb} KiB${formatText}，${viaText}。画面附在本回执里。` +
+    const lines: string[] = [`已截${what}：${result.width}x${result.height}，${kb} KiB${formatText}，${viaText}。`];
+
+    // 框出屏幕外会被夹紧，说清楚实际抓的是哪一块，免得她以为是别的毛病。
+    if (
+      target.target === 'region' &&
+      (cap.x !== target.region.x ||
+        cap.y !== target.region.y ||
+        cap.width !== target.region.width ||
+        cap.height !== target.region.height)
+    ) {
+      lines.push(
+        `（你框的是 x=${target.region.x} y=${target.region.y} ${target.region.width}x${target.region.height}，` +
+          '有一部分在屏幕外，已夹到屏幕内。）',
+      );
+    }
+    if (result.downscaled) {
+      lines.push(
+        `（这块比 ${SCREENSHOT_MAX_EDGE} 像素的上限大，画面被压成了 ${result.width}x${result.height}——` +
+          '想看清小字就把框框小一点，小框是按原始像素给的。）',
+      );
+    } else if (target.target === 'region') {
+      lines.push('（这块没超过上限，是按原始像素给的。）');
+    }
+
+    if (target.target === 'region') {
+      const change = this.noteRegionChange(cap, result.bytes);
+      if (change) lines.push(change);
+    }
+
+    lines.push(
       '这张图是临时的：它会一直跟着你的上下文走，每一轮请求都重发一遍，直到被挤出去；' +
-      '看完要紧的东西就写成文字，图掉了你手里还有那行字。';
+        '看完要紧的东西就写成文字，图掉了你手里还有那行字。',
+    );
     if (this.shotCount > 1) {
-      text += `（这是本次运行第 ${this.shotCount} 张。想接着看他在干什么，用 presence_windows 更省。）`;
+      lines.push(`（这是本次运行第 ${this.shotCount} 张。想接着看他在干什么，用 presence_windows 更省。）`);
     }
     if (this.host && !this.host.modelFacts.accepts(mime)) {
-      text += '当前模型配置不吃图，你只能看到这行文字说明，看不到画面本身。';
+      lines.push('当前模型配置不吃图，你只能看到这些文字说明，看不到画面本身。');
     }
     return {
-      text,
+      text: lines.join('\n'),
       blobs: [
         {
           bytes: result.bytes,
@@ -492,6 +566,27 @@ export class PresenceWorld implements World {
         '已切到 ambient：变化照样记，但攒成批合并投出、不叫醒你——等你下次开口时一起到。' +
         '想看现在就调 presence_windows，攒的会当场给。',
     };
+  }
+
+  // ——— 截图 ———
+
+  /**
+   * 同一块区域的前后对比：只比字节，完全相同就是像素级没变。
+   * 时钟、光标、滚动条这类一直在动的东西会让它永远报「有变化」——回执里说明了这点。
+   */
+  private noteRegionChange(cap: Rect, bytes: Buffer): string {
+    const key = `${cap.x},${cap.y},${cap.width},${cap.height}`;
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    const before = this.regionHashes.get(key);
+    if (this.regionHashes.size >= 64) {
+      const oldest = this.regionHashes.keys().next().value;
+      if (oldest !== undefined) this.regionHashes.delete(oldest);
+    }
+    this.regionHashes.set(key, hash);
+    if (before === undefined) return '（这是本次运行第一次看这块。）';
+    return before === hash
+      ? '（和上次看这块一样：像素级完全相同。）'
+      : '（和上次看这块比：有变化。时钟、光标这类一直在动的东西也会让它显示有变化。）';
   }
 
   // ——— 事件与状态 ———
