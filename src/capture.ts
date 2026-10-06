@@ -24,6 +24,16 @@ export const PHOTO_BYTES_PER_PIXEL = 0.5;
 export const JPEG_QUALITY = 80;
 /** 区域的最小边：太小的框截出来没意义，还会让她以为是程序坏了。 */
 export const REGION_MIN_EDGE = 16;
+/**
+ * 格线的基准间距（桌面像素）。图上每条线都落在「桌面坐标的整百处」上，线旁边标着那个坐标，
+ * 所以她照着数字读就行，不用做任何换算——这是这套格线存在的全部理由。
+ */
+export const GRID_BASE_STEP = 100;
+/**
+ * 格线之间在**图上**至少留这么宽（图上的像素）。再密就糊成一片，反而不好读。
+ * 被压过的大图会因此把间距翻倍（2560 宽压到 1600 时：100 → 200 桌面像素，图上约 125px）。
+ */
+export const GRID_MIN_GAP_PX = 70;
 
 export interface Rect {
   x: number;
@@ -37,6 +47,15 @@ export type ScreenshotTarget =
   | { target: 'foreground' }
   | { target: 'window'; hwnd: number }
   | { target: 'region'; region: Rect };
+
+/** 叠在图上那层格线实际画成了什么样（图上真画了几条、间距多少桌面像素）。 */
+export interface GridInfo {
+  /** 桌面坐标上的间距。`GRID_BASE_STEP` 起，密不下就翻倍。 */
+  step: number;
+  /** 竖线、横线各画了几条。 */
+  vertical: number;
+  horizontal: number;
+}
 
 export interface ScreenshotResult {
   bytes: Buffer;
@@ -55,6 +74,13 @@ export interface ScreenshotResult {
   via: 'screen' | 'printwindow';
   /** 目标窗口的标题；全屏与区域时为空。 */
   title: string;
+  /** 图上的格线；没叠就是 null。 */
+  grid: GridInfo | null;
+}
+
+/** 截图的可选项。`grid` 叠一层带桌面坐标标注的淡格线（她要从图上读坐标时加它）。 */
+export interface CaptureOptions {
+  grid?: boolean;
 }
 
 export interface MonitorInfo {
@@ -138,7 +164,7 @@ function runPowerShellJson(script: string, timeoutMs: number): Promise<Record<st
 }
 
 /** 截屏脚本。target 与区域坐标是模板里插进去的常量；出错输出 `{ok:false,error}`，不抛裸栈。 */
-function captureScript(target: ScreenshotTarget): string {
+function captureScript(target: ScreenshotTarget, grid: boolean): string {
   const kind = target.target;
   const hwnd = target.target === 'window' ? String(Math.trunc(target.hwnd)) : '0';
   const rx = target.target === 'region' ? String(Math.trunc(target.region.x)) : '0';
@@ -276,6 +302,57 @@ public static class PresenceCap {
   }
   $ow = $src.Width
   $oh = $src.Height
+  # 格线:画在**最终的图**上（降采样之后），所以线是 1px 的、标注也是按图上的字号来的。
+  # 每条线落在「桌面坐标的整百处」（密不下就翻倍），线旁边标着那个桌面坐标——
+  # 她照着数字读就行，不用拿图上像素去乘那个比例（她这么算错过两次）。
+  $gridInfo = $null
+  if (${grid ? '$true' : '$false'}) {
+    $ipx = $ow / $rect.w
+    $ipy = $oh / $rect.h
+    $step = ${GRID_BASE_STEP}
+    while (($step * $ipx) -lt ${GRID_MIN_GAP_PX}) { $step = $step * 2 }
+    $g4 = [System.Drawing.Graphics]::FromImage($src)
+    # 线选青色、半透明:白底黑底上都看得见，又不盖住底下的字。
+    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(95, 0, 190, 255)), 1
+    # 标注给一个深底白字的小方块——只留白字在浅色界面上会看不见。
+    $back = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(165, 20, 20, 20))
+    $ink = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(235, 255, 255, 255))
+    $font = New-Object System.Drawing.Font 'Consolas', 11
+    $vx = 0
+    $hy = 0
+    $dx = [Math]::Ceiling($rect.x / $step) * $step
+    while ($dx -lt ($rect.x + $rect.w)) {
+      $ix = [int][Math]::Round(($dx - $rect.x) * $ipx)
+      if ($ix -ge 0 -and $ix -lt $ow) {
+        $g4.DrawLine($pen, $ix, 0, $ix, $oh - 1)
+        $label = 'x=' + $dx
+        $sz = $g4.MeasureString($label, $font)
+        $g4.FillRectangle($back, $ix + 1, 1, [int]$sz.Width + 2, [int]$sz.Height + 1)
+        $g4.DrawString($label, $font, $ink, $ix + 2, 1)
+        $vx = $vx + 1
+      }
+      $dx = $dx + $step
+    }
+    $dy = [Math]::Ceiling($rect.y / $step) * $step
+    while ($dy -lt ($rect.y + $rect.h)) {
+      $iy = [int][Math]::Round(($dy - $rect.y) * $ipy)
+      if ($iy -ge 0 -and $iy -lt $oh) {
+        $g4.DrawLine($pen, 0, $iy, $ow - 1, $iy)
+        $label = 'y=' + $dy
+        $sz = $g4.MeasureString($label, $font)
+        $g4.FillRectangle($back, 1, $iy + 1, [int]$sz.Width + 2, [int]$sz.Height + 1)
+        $g4.DrawString($label, $font, $ink, 2, $iy + 1)
+        $hy = $hy + 1
+      }
+      $dy = $dy + $step
+    }
+    $g4.Dispose()
+    $pen.Dispose()
+    $back.Dispose()
+    $ink.Dispose()
+    $font.Dispose()
+    $gridInfo = @{ step = $step; vertical = $vx; horizontal = $hy }
+  }
   $pngMs = New-Object System.IO.MemoryStream
   $src.Save($pngMs, [System.Drawing.Imaging.ImageFormat]::Png)
   $pngBytes = $pngMs.ToArray()
@@ -294,7 +371,7 @@ public static class PresenceCap {
   $src.Dispose()
   $b64 = [Convert]::ToBase64String($bytes)
   $captured = @{ x = $rect.x; y = $rect.y; width = $rect.w; height = $rect.h }
-  Out-Json @{ ok = $true; data = $b64; format = $format; bytes = $bytes.Length; width = $ow; height = $oh; captured = $captured; downscaled = $downscaled; via = $via; title = $title }
+  Out-Json @{ ok = $true; data = $b64; format = $format; bytes = $bytes.Length; width = $ow; height = $oh; captured = $captured; downscaled = $downscaled; via = $via; title = $title; grid = $gridInfo }
 } catch {
   Out-Json @{ ok = $false; error = $_.Exception.Message }
 }
@@ -451,8 +528,13 @@ export function parseRegion(args: Record<string, unknown>): Rect | string {
 }
 
 /** 截一张。她说要才调用；失败抛错（World 转成失败回执），错误文案给人看。 */
-export async function captureScreenshot(target: ScreenshotTarget, timeoutMs = 20000): Promise<ScreenshotResult> {
-  const result = await runPowerShellJson(captureScript(target), timeoutMs);
+export async function captureScreenshot(
+  target: ScreenshotTarget,
+  timeoutMs = 20000,
+  options: CaptureOptions = {},
+): Promise<ScreenshotResult> {
+  const grid = options.grid === true;
+  const result = await runPowerShellJson(captureScript(target, grid), timeoutMs);
   if (result.ok !== true) {
     throw new Error(typeof result.error === 'string' ? result.error : '截图失败，原因不明');
   }
@@ -468,7 +550,74 @@ export async function captureScreenshot(target: ScreenshotTarget, timeoutMs = 20
     downscaled: result.downscaled === true,
     via: result.via === 'printwindow' ? 'printwindow' : 'screen',
     title: typeof result.title === 'string' ? result.title : '',
+    grid: parseGrid(result.grid),
   };
+}
+
+/** 脚本报回来的格线信息。形状不对就当没叠（宁可少说一句，也不报一个假的间距）。 */
+function parseGrid(raw: unknown): GridInfo | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const g = raw as Record<string, unknown>;
+  const step = Number(g.step ?? 0);
+  const vertical = Number(g.vertical ?? 0);
+  const horizontal = Number(g.horizontal ?? 0);
+  if (!Number.isFinite(step) || step <= 0) return null;
+  if (vertical + horizontal <= 0) return null;
+  return { step: Math.round(step), vertical: Math.max(0, Math.round(vertical)), horizontal: Math.max(0, Math.round(horizontal)) };
+}
+
+/**
+ * 格线在这个缩放下的间距（桌面像素）。与 `captureScript` 里那段同一条规则——
+ * 回执要预告「要是加了格线，间距会是多少」，那就得和真画出来的那个数一致。
+ */
+export function gridStepFor(imageWidth: number, capturedWidth: number): number {
+  if (capturedWidth <= 0 || imageWidth <= 0) return GRID_BASE_STEP;
+  const perImagePx = imageWidth / capturedWidth;
+  let step = GRID_BASE_STEP;
+  while (step * perImagePx < GRID_MIN_GAP_PX) step *= 2;
+  return step;
+}
+
+/**
+ * 「这张图怎么换算成桌面坐标」——**跟图一起回去**的那一句。
+ *
+ * 她量错过两次:拿着被压过的窗口截图按原始像素算，于是先点到了旁边的「≡」、后来又把 VoiceMeeter
+ * 抬到了前面。所以这句话不能只住在环境提示词里:她读到它的时候，正是要量的时候。
+ * 叠了格线那一次更省事——线上的数字就是桌面坐标，一次乘法都不用做。
+ */
+export function describeShotGeometry(
+  result: Pick<ScreenshotResult, 'width' | 'height' | 'captured' | 'downscaled' | 'grid'>,
+): string {
+  const cap = result.captured;
+  const per = cap.width > 0 && result.width > 0 ? cap.width / result.width : 1;
+  const lines: string[] = [];
+  if (result.downscaled) {
+    lines.push(
+      `**这张图被压过**（${cap.width}×${cap.height} → ${result.width}×${result.height}）:` +
+        `**图上 1 像素 = 桌面 ${per.toFixed(2)} 像素**——按图上的像素直接当桌面像素用就会偏。`,
+    );
+  } else {
+    lines.push('这张图没被压:**图上的点就是桌面的点**（1:1）。');
+  }
+  const scale = per === 1 ? '' : ` × ${per.toFixed(2)}`;
+  lines.push(
+    `图上的 (px,py) → 桌面 (${cap.x} + px${scale}, ${cap.y} + py${scale});` +
+      `图的左上角那一点是桌面 (${cap.x}, ${cap.y})。`,
+  );
+  if (result.grid) {
+    lines.push(
+      `图上叠了淡格线:**每 ${result.grid.step} 桌面像素一条**（竖线 ${result.grid.vertical} 条、横线 ` +
+        `${result.grid.horizontal} 条），**每条线旁边就标着它自己的桌面坐标**（写 x=… 的是竖线、y=… 的是横线）` +
+        '——照着线上的数字读，一次乘法都不用做。',
+    );
+  } else {
+    const step = gridStepFor(result.width, cap.width);
+    lines.push(
+      `要按图量坐标（点别的东西、读某个控件在哪）:**下一步加 grid:true**——图上会叠一层每 ${step} ` +
+        '桌面像素一条的淡格线、线旁标着桌面坐标，照着读就不用换算。',
+    );
+  }
+  return lines.join('\n');
 }
 
 /** 一个对象也可能是 ConvertTo-Json 把单元素数组拍平的结果，兜一下。 */

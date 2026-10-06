@@ -27,8 +27,10 @@ import { fileURLToPath } from 'node:url';
 import {
   SCREENSHOT_MAX_EDGE,
   captureScreenshot,
+  describeShotGeometry,
   listWindows,
   parseRegion,
+  type CaptureOptions,
   type Rect,
   type ScreenshotResult,
   type ScreenshotTarget,
@@ -61,7 +63,7 @@ export interface PresenceWorldOptions {
   /** 测试用：换掉列窗口。 */
   listWindows?: () => Promise<WindowList>;
   /** 测试用：换掉截图。 */
-  capture?: (target: ScreenshotTarget) => Promise<ScreenshotResult>;
+  capture?: (target: ScreenshotTarget, options?: CaptureOptions) => Promise<ScreenshotResult>;
   /** 测试用：调小 ambient 攒批的字数上限。 */
   ambientFlushChars?: number;
   /** 测试用：调小 ambient 攒批的时限（毫秒）。 */
@@ -410,6 +412,12 @@ export class PresenceWorld implements World {
             enum: ['foreground', 'full'],
             description: 'foreground = 只截当前前台窗口（默认）；full = 全部显示器拼一张。',
           },
+          grid: {
+            type: 'boolean',
+            description:
+              '叠一层淡格线：每条线落在桌面坐标的整百处、线旁标着那个坐标——要按图上的位置去点' +
+              '什么东西（量坐标）时加它，照着线旁的数字读就行。只是"看看他在干嘛"就不用加。',
+          },
         },
       },
       handler: (args) => this.takeScreenshot(args),
@@ -435,8 +443,9 @@ export class PresenceWorld implements World {
 
     let result: ScreenshotResult;
     try {
-      const capture = this.opts.capture ?? ((t: ScreenshotTarget) => captureScreenshot(t, CAPTURE_TIMEOUT_MS));
-      result = await capture(target);
+      const wantsGrid = args.grid === true;
+      const capture = this.opts.capture ?? ((t: ScreenshotTarget, o?: CaptureOptions) => captureScreenshot(t, CAPTURE_TIMEOUT_MS, o));
+      result = await capture(target, { grid: wantsGrid });
     } catch (err) {
       const hint =
         target.target === 'foreground' ? '（不想截前台、就想硬截一下屏幕的话，传 target:"full"。）' : '';
@@ -477,14 +486,13 @@ export class PresenceWorld implements World {
           '有一部分在屏幕外，已夹到屏幕内。）',
       );
     }
+    // 「这张图怎么换算成桌面坐标」跟图一起回去——她读到它的时候正是要量的时候。
+    // 她按被压过的图直接当原始像素算，点偏过两次（先点到旁边的「≡」、后来把 VoiceMeeter 抬到前面），
+    // 所以这一段不是补充说明，是这一步回执的正文之一。
     if (result.downscaled) {
-      lines.push(
-        `（这块比 ${SCREENSHOT_MAX_EDGE} 像素的上限大，画面被压成了 ${result.width}x${result.height}——` +
-          '想看清小字就把框框小一点，小框是按原始像素给的。）',
-      );
-    } else if (target.target === 'region') {
-      lines.push('（这块没超过上限，是按原始像素给的。）');
+      lines.push(`（这块比 ${SCREENSHOT_MAX_EDGE} 像素的上限大，所以被压过——想看清小字就把框框小一点，小框是按原始像素给的。）`);
     }
+    for (const line of describeShotGeometry(result).split('\n')) lines.push(line);
 
     if (target.target === 'region') {
       const change = this.noteRegionChange(cap, result.bytes);

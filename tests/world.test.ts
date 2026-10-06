@@ -60,7 +60,7 @@ interface Build {
   host: FakeHost;
   sensor: FakeSensor;
   tools: Record<string, ToolDef>;
-  calls: { listWindows: number; captures: ScreenshotTarget[] };
+  calls: { listWindows: number; captures: ScreenshotTarget[]; grids: boolean[] };
 }
 
 function build(
@@ -68,7 +68,7 @@ function build(
   cfgPatch: Partial<PresenceConfigSection> = {},
 ): Build {
   const sensor = new FakeSensor();
-  const calls = { listWindows: 0, captures: [] as ScreenshotTarget[] };
+  const calls = { listWindows: 0, captures: [] as ScreenshotTarget[], grids: [] as boolean[] };
   const windows: WindowInfo[] = [
     { ...WIN_B, foreground: true, minimized: false, bounds: { x: 100, y: 50, width: 1200, height: 800 } },
     { ...WIN_A, foreground: false, minimized: true, bounds: { x: 0, y: 0, width: 0, height: 0 } },
@@ -91,19 +91,24 @@ function build(
       calls.listWindows += 1;
       return { windows, screen };
     },
-    capture: async (target) => {
+    capture: async (target, options) => {
       calls.captures.push(target);
+      calls.grids.push(options?.grid === true);
       const result: ScreenshotResult = {
         bytes: pngBytes(),
         format: 'png',
-        width: 800,
-        height: 600,
+        // 区域那条路是真的 1:1（小框不走降采样），所以假截屏也照这个来:
+        // 区域给框的尺寸，别的不给 800x600。
+        width: target.target === 'region' ? target.region.width : 800,
+        height: target.target === 'region' ? target.region.height : 600,
         captured:
           target.target === 'region'
             ? { ...target.region }
             : { x: 0, y: 0, width: 800, height: 600 },
         downscaled: false,
         via: 'printwindow',
+        // 假截屏照真那条的样子：要了格线才报格线（回执那几句是从这里出来的）。
+        grid: options?.grid === true ? { step: 100, vertical: 8, horizontal: 6 } : null,
         title: '测试窗口',
       };
       return result;
@@ -270,6 +275,7 @@ describe('Presence World', () => {
         captured: { x: 0, y: 0, width: 1600, height: 900 },
         downscaled: false,
         via: 'screen' as const,
+        grid: null,
         title: '视频窗口',
       }),
     });
@@ -315,14 +321,15 @@ describe('Presence World', () => {
   });
 
   describe('presence_screenshot 的区域', () => {
-    it('给了 width/height 就按区域截，坐标原样传下去，回执说明是原始像素', async () => {
+    it('给了 width/height 就按区域截，坐标原样传下去，回执说明图上就是桌面', async () => {
       const { world, tools, calls } = build();
       await world.start(new FakeHost());
       const out = await call(tools.presence_screenshot, { x: 600, y: 300, width: 400, height: 200 });
       expect(calls.captures[0]).toEqual({ target: 'region', region: { x: 600, y: 300, width: 400, height: 200 } });
       expect(out.failed).toBeUndefined();
       expect(out.text).toContain('区域 x=600 y=300 400x200');
-      expect(out.text).toContain('原始像素');
+      expect(out.text).toContain('图上的点就是桌面的点');
+      expect(out.text).toContain('图上的 (px,py) → 桌面 (600 + px, 300 + py)');
     });
 
     it('x/y 不给算 0', async () => {
@@ -354,6 +361,7 @@ describe('Presence World', () => {
           captured: { x: 2000, y: 0, width: 560, height: 100 }, // 右侧超出，被夹回
           downscaled: false,
           via: 'screen' as const,
+          grid: null,
           title: '',
         }),
       });
@@ -363,7 +371,7 @@ describe('Presence World', () => {
       expect(out.text).toContain('区域 x=2000 y=0 560x100');
     });
 
-    it('区域超过上限被压过时提醒她框小一点', async () => {
+    it('区域超过上限被压过：提醒框小一点，并且把「图上 1px = 桌面多少 px」写出来', async () => {
       const { world, tools } = build({
         capture: async () => ({
           bytes: pngBytes(),
@@ -373,13 +381,37 @@ describe('Presence World', () => {
           captured: { x: 0, y: 0, width: 3000, height: 2000 },
           downscaled: true,
           via: 'screen' as const,
+          grid: null,
           title: '',
         }),
       });
       await world.start(new FakeHost());
       const out = await call(tools.presence_screenshot, { width: 3000, height: 2000 });
-      expect(out.text).toContain('被压成了 1600x1200');
       expect(out.text).toContain('框小一点');
+      // 这一句是她点偏两次的直接原因：被压过的图不能按原始像素算。
+      expect(out.text).toContain('图上 1 像素 = 桌面 1.88 像素');
+      expect(out.text).toContain('3000×2000 → 1600×1200');
+      expect(out.text).toContain('grid:true'); // 没叠格线时告诉她下一步怎么量得准
+    });
+
+    it('加了 grid:true 就把格线的间距与条数写进回执', async () => {
+      const { world, tools, calls } = build();
+      await world.start(new FakeHost());
+      const out = await call(tools.presence_screenshot, { target: 'full', grid: true });
+      // grid 要真的传到截屏那一层（不是只在回执里换个说法）
+      expect(calls.grids).toEqual([true]);
+      expect(out.text).toContain('每 100 桌面像素一条');
+      expect(out.text).toContain('竖线 8 条、横线 6 条');
+      expect(out.text).toContain('照着线上的数字读');
+    });
+
+    it('不给 grid 时不叠格线，并在回执里告诉她怎么量得准', async () => {
+      const { world, tools, calls } = build();
+      await world.start(new FakeHost());
+      const out = await call(tools.presence_screenshot, { target: 'full' });
+      expect(calls.grids).toEqual([false]);
+      expect(out.text).not.toContain('图上叠了淡格线');
+      expect(out.text).toContain('grid:true');
     });
 
     it('同一块区域反复看：第一次说第一次，没变就说没变，变了就说有变化', async () => {
@@ -393,6 +425,7 @@ describe('Presence World', () => {
           captured: { x: 10, y: 20, width: 300, height: 200 },
           downscaled: false,
           via: 'screen' as const,
+          grid: null,
           title: '',
         }),
       });
