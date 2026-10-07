@@ -59,11 +59,11 @@ export interface GridInfo {
 
 /**
  * 光标有没有画进这张图，没画时是哪一种原因。
- * `drawn` 画了 / `hidden` 系统这一刻把光标藏起来了（全屏视频、某些程序会这样）/
- * `offscreen` 光标不在这张图覆盖的那块里 / `printwindow` 这张图不是抓屏来的（窗口自己绘的帧）/
- * `unknown` 读不到光标在哪。
+ * `drawn` 画了 / `omitted` 她这次说了不要箭头（位置照报）/ `hidden` 系统这一刻把光标藏起来了
+ * （全屏视频、某些程序会这样）/ `offscreen` 光标不在这张图覆盖的那块里 /
+ * `printwindow` 这张图不是抓屏来的（窗口自己绘的帧）/ `unknown` 读不到光标在哪。
  */
-export type CursorDraw = 'drawn' | 'hidden' | 'offscreen' | 'printwindow' | 'unknown';
+export type CursorDraw = 'drawn' | 'omitted' | 'hidden' | 'offscreen' | 'printwindow' | 'unknown';
 
 /** 截图那一刻光标在哪，以及它有没有进这张图。 */
 export interface CursorInfo {
@@ -99,6 +99,12 @@ export interface ScreenshotResult {
 /** 截图的可选项。`grid` 叠一层带桌面坐标标注的淡格线（她要从图上读坐标时加它）。 */
 export interface CaptureOptions {
   grid?: boolean;
+  /**
+   * 要不要把光标画进图里（默认画）。`false` 时**仍然读光标、仍然在回执里报它的坐标**，
+   * 只是不在图上画那个箭头——她「盯一块看变化」或要读那一块的小字时用得上：
+   * 光标正好停在框里的话，一个会动的箭头会让「和上次像素级完全相同」永远说不出口。
+   */
+  cursor?: boolean;
 }
 
 export interface MonitorInfo {
@@ -181,8 +187,27 @@ function runPowerShellJson(script: string, timeoutMs: number): Promise<Record<st
   });
 }
 
-/** 截屏脚本。target 与区域坐标是模板里插进去的常量；出错输出 `{ok:false,error}`，不抛裸栈。 */
-function captureScript(target: ScreenshotTarget, grid: boolean): string {
+/**
+ * 截屏脚本。target、区域坐标与两个开关是模板里插进去的常量；出错输出 `{ok:false,error}`，不抛裸栈。
+ *
+ * **导出是为了测试**:它是 `-EncodedCommand` 传上去的,而**命令行有长度上限**
+ * (`windows` 约 32767 字符,UTF-16 再 base64 会把脚本放大 2.67 倍),所以 `capture.test.ts` 里有一条
+ * 用例盯着它的编码后长度。**写进这个模板的每个字都要按 2.67 倍算钱**——解释写在 TS 这边,
+ * 模板里只留短指引(2026-10-07 就是这么被 `spawn ENAMETOOLONG` 顶回来的)。
+ *
+ * 图上的光标(2026-10-07 加,理由写在 TS 这边而不是模板里):
+ * - 抓屏拍不到光标本身(量过:围着光标框一张 PNG,图里没有箭头),而看图干活的模型没有别的办法
+ *   知道光标在哪,所以用 `GetCursorInfo` 读位置与位图、`DrawIconEx` 画上去。形状是系统真光标,
+ *   于是它还顺带回答「这一点上是什么」(I 形=能打字,沙漏=忙)。
+ * - **画在降采样与格线之后**,按画面比例缩但最小 16px(跟着一起缩的话,被压过的大图上它会糊成一个点);
+ *   **只画真抓屏的图**——`hwnd` 那条走 `PrintWindow`,那是窗口自己绘的帧(可能被盖着、光标不在上面),
+ *   画上去就是骗人。
+ * - **她可以不要箭头**(`cursor:false`)——盯一块看变化、或读那一块小字时:光标正好停在框里的话,
+ *   一个会动的箭头让「和上次像素级完全相同」永远说不出口,也会盖住字。**位置照读照报**,可选的只有箭头。
+ * - 四种「没画」各有各的说法(她说了不要箭头 / 系统把光标藏了 / 光标不在这块 / 这张不是抓屏来的 /
+ *   读不出来),一句话对应一种下一步动作,所以她不该靠猜。
+ */
+export function captureScript(target: ScreenshotTarget, grid: boolean, drawCursor: boolean): string {
   const kind = target.target;
   const hwnd = target.target === 'window' ? String(Math.trunc(target.hwnd)) : '0';
   const rx = target.target === 'region' ? String(Math.trunc(target.region.x)) : '0';
@@ -231,9 +256,7 @@ public static class PresenceCap {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RECT rect, int sizeOfRect);
-  // The pointer itself. A screen grab does not contain the cursor (measured 2026-10-06: a PNG framed
-  // around the pointer has no arrow in it), so a model working from a picture has no other way to
-  // see where the pointer is -- and where the pointer is, is half of "what would a click here hit".
+  // The pointer. A screen grab does not contain the cursor (measured 2026-10-06), so it is drawn on.
   [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO info);
   [DllImport("user32.dll")] public static extern bool DrawIconEx(IntPtr hdc, int xLeft, int yTop, IntPtr hIcon, int cxWidth, int cyWidth, int istepIfAniCur, IntPtr hbrFlickerFreeDraw, int diFlags);
   // 13 = SM_CXCURSOR, 14 = SM_CYCURSOR: the system cursor's own size at the current DPI.
@@ -289,8 +312,7 @@ public static class PresenceCap {
     $rect = @{ x = $r.Left; y = $r.Top; w = $w; h = $bh }
   }
 
-  # The pointer, read BEFORE the grab: whichever instant the frame carries, the sample closest to
-  # it is the honest one, and reading it here keeps this in one place instead of once per branch.
+  # Pointer read BEFORE the grab: the sample closest to the frame is the honest one.
   $curOk = $false
   $curX = 0
   $curY = 0
@@ -303,8 +325,7 @@ public static class PresenceCap {
     $curX = $ci.ptScreenPos.X
     $curY = $ci.ptScreenPos.Y
     $curIcon = $ci.hCursor
-    # CURSORINFO.flags: 1 = CURSOR_SHOWING. The system hides the pointer itself for fullscreen
-    # video and for some apps; drawing one anyway would be inventing something that is not there.
+    # flags: 1 = CURSOR_SHOWING. The system hides the pointer itself for fullscreen video.
     $curShown = (($ci.flags -band 1) -ne 0)
   }
 
@@ -399,14 +420,12 @@ public static class PresenceCap {
     $font.Dispose()
     $gridInfo = @{ step = $step; vertical = $vx; horizontal = $hy }
   }
-  # The pointer, drawn onto the FINISHED image: after the downscale (given its real size scaled down
-  # with everything else it would be a smudge, so it is drawn at a readable size instead) and after
-  # the grid (so no line crosses it). Only for a real screen grab -- PrintWindow returns the window's
-  # own frame, which is not what is on the screen, so a pointer on that would be a lie.
+  # The pointer, onto the finished image; screen grab only (rationale above captureScript).
   $draw = 'unknown'
   $ipx = $ow / $rect.w
   $ipy = $oh / $rect.h
   if (-not $curOk) { $draw = 'unknown' }
+  elseif (-not ${drawCursor ? '$true' : '$false'}) { $draw = 'omitted' }
   elseif ($via -eq 'printwindow') { $draw = 'printwindow' }
   elseif (-not $curShown) { $draw = 'hidden' }
   else {
@@ -418,12 +437,12 @@ public static class PresenceCap {
       $curSh = [PresenceCap]::GetSystemMetrics(14)
       if ($curSw -le 0) { $curSw = 32 }
       if ($curSh -le 0) { $curSh = 32 }
-      $curDw = [int][Math]::Max(16, [Math]::Round($curSw * $ipx))
-      $curDh = [int][Math]::Max(16, [Math]::Round($curSh * $ipy))
+      # Its real size scaled with the picture, but never so small it cannot be seen.
+      $curDw = [int][Math]::Max(16, [int][Math]::Round($curSw * $ipx))
+      $curDh = [int][Math]::Max(16, [int][Math]::Round($curSh * $ipy))
       $g5 = [System.Drawing.Graphics]::FromImage($src)
       $hdc5 = $g5.GetHdc()
-      # 3 = DI_NORMAL (draw the icon and its mask). The handle is the system's own -- never destroyed
-      # here, because it belongs to the desktop, not to us.
+      # 3 = DI_NORMAL. The handle belongs to the desktop and is never destroyed here.
       if ([PresenceCap]::DrawIconEx($hdc5, $curIx, $curIy, $curIcon, $curDw, $curDh, 0, [IntPtr]::Zero, 3)) { $draw = 'drawn' }
       $g5.ReleaseHdc($hdc5)
       $g5.Dispose()
@@ -610,7 +629,8 @@ export async function captureScreenshot(
   options: CaptureOptions = {},
 ): Promise<ScreenshotResult> {
   const grid = options.grid === true;
-  const result = await runPowerShellJson(captureScript(target, grid), timeoutMs);
+  const drawCursor = options.cursor !== false;
+  const result = await runPowerShellJson(captureScript(target, grid, drawCursor), timeoutMs);
   if (result.ok !== true) {
     throw new Error(typeof result.error === 'string' ? result.error : '截图失败，原因不明');
   }
@@ -638,7 +658,7 @@ function parseCursor(raw: unknown): CursorInfo {
   const y = numOrNull(c.y);
   if (x === null || y === null) return { x: null, y: null, draw: 'unknown' };
   const draw =
-    c.draw === 'drawn' || c.draw === 'hidden' || c.draw === 'offscreen' || c.draw === 'printwindow'
+    c.draw === 'drawn' || c.draw === 'omitted' || c.draw === 'hidden' || c.draw === 'offscreen' || c.draw === 'printwindow'
       ? c.draw
       : 'unknown';
   return { x, y, draw };
@@ -729,6 +749,8 @@ export function describeShotCursor(result: Pick<ScreenshotResult, 'cursor' | 'ca
   switch (c.draw) {
     case 'drawn':
       return `鼠标在 ${at}：**图上那个箭头就是它**（抓屏抓不到光标本身，箭头是我照系统当前的样子画上去的）。`;
+    case 'omitted':
+      return `鼠标在 ${at}；你说了这次不要箭头，**图上没有画它**（位置还是要报的，就是这一句）。`;
     case 'hidden':
       return `鼠标在 ${at}，但**系统这一刻把它藏起来了**（全屏视频、有些程序会自己隐藏指针），所以在图上没有箭头。`;
     case 'offscreen':

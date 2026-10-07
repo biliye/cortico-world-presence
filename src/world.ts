@@ -393,7 +393,9 @@ export class PresenceWorld implements World {
         '(2) give a hwnd to capture that whole window; (3) give target "foreground" (default) or "full". ' +
         'Regions under the size cap come back at native pixels, so a SMALL region is how you read small text: ' +
         'framing tighter beats framing wider. The mouse pointer is drawn onto the picture (a screen grab does ' +
-        'not contain the cursor) and its desktop position is in the receipt. ' +
+        'not contain the cursor) and its desktop position is in the receipt; pass cursor:false to leave the ' +
+        'arrow off while keeping that position — what you want when watching one small area for changes or ' +
+        'reading small text there. ' +
         'Only call this when you actually want to look; the picture rides ' +
         'along with every later request until it falls out of your context, so for "what is he doing" over time ' +
         'presence_windows is far cheaper.',
@@ -421,6 +423,14 @@ export class PresenceWorld implements World {
               '叠一层淡格线：每条线落在桌面坐标的整百处、线旁标着那个坐标——要按图上的位置去点' +
               '什么东西（量坐标）时加它，照着线旁的数字读就行。只是"看看他在干嘛"就不用加。',
           },
+          cursor: {
+            type: 'boolean',
+            description:
+              '要不要在图上画鼠标箭头（默认画；抓屏抓不到光标，所以是我们画上去的，形状是系统真光标）。' +
+              '**盯同一块看变化**、或者**要读那一块的小字**时传 false：光标停在框里的话，一个会动的箭头' +
+              '会让「和上次像素级完全相同」永远说不出口，也会盖住字。光标在哪那句坐标**照给不误**，' +
+              '关掉的只是图上那个箭头。',
+          },
         },
       },
       handler: (args) => this.takeScreenshot(args),
@@ -447,8 +457,9 @@ export class PresenceWorld implements World {
     let result: ScreenshotResult;
     try {
       const wantsGrid = args.grid === true;
+      const wantsCursor = args.cursor !== false;
       const capture = this.opts.capture ?? ((t: ScreenshotTarget, o?: CaptureOptions) => captureScreenshot(t, CAPTURE_TIMEOUT_MS, o));
-      result = await capture(target, { grid: wantsGrid });
+      result = await capture(target, { grid: wantsGrid, cursor: wantsCursor });
     } catch (err) {
       const hint =
         target.target === 'foreground' ? '（不想截前台、就想硬截一下屏幕的话，传 target:"full"。）' : '';

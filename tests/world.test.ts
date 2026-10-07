@@ -60,7 +60,7 @@ interface Build {
   host: FakeHost;
   sensor: FakeSensor;
   tools: Record<string, ToolDef>;
-  calls: { listWindows: number; captures: ScreenshotTarget[]; grids: boolean[] };
+  calls: { listWindows: number; captures: ScreenshotTarget[]; grids: boolean[]; cursors: boolean[] };
 }
 
 function build(
@@ -68,7 +68,7 @@ function build(
   cfgPatch: Partial<PresenceConfigSection> = {},
 ): Build {
   const sensor = new FakeSensor();
-  const calls = { listWindows: 0, captures: [] as ScreenshotTarget[], grids: [] as boolean[] };
+  const calls = { listWindows: 0, captures: [] as ScreenshotTarget[], grids: [] as boolean[], cursors: [] as boolean[] };
   const windows: WindowInfo[] = [
     { ...WIN_B, foreground: true, minimized: false, bounds: { x: 100, y: 50, width: 1200, height: 800 } },
     { ...WIN_A, foreground: false, minimized: true, bounds: { x: 0, y: 0, width: 0, height: 0 } },
@@ -94,6 +94,7 @@ function build(
     capture: async (target, options) => {
       calls.captures.push(target);
       calls.grids.push(options?.grid === true);
+      calls.cursors.push(options?.cursor !== false);
       const result: ScreenshotResult = {
         bytes: pngBytes(),
         format: 'png',
@@ -109,7 +110,8 @@ function build(
         via: 'printwindow',
         // 假截屏照真那条的样子：要了格线才报格线（回执那几句是从这里出来的）。
         grid: options?.grid === true ? { step: 100, vertical: 8, horizontal: 6 } : null,
-        cursor: { x: 640, y: 360, draw: 'printwindow' },
+        // 假截屏照真那条的样子：说了不要箭头就报 omitted（位置照给），否则报画了。
+        cursor: options?.cursor === false ? { x: 640, y: 360, draw: 'omitted' } : { x: 640, y: 360, draw: 'drawn' },
         title: '测试窗口',
       };
       return result;
@@ -293,6 +295,27 @@ describe('Presence World', () => {
     const second = await call(tools.presence_screenshot, {});
     expect(second.text).toContain('第 2 张');
     expect(second.text).toContain('presence_windows');
+  });
+
+  /**
+   * 光标那个开关:她可以不要图上的箭头，但**位置那句不能跟着没了**——「盯一块看变化」与「读小字」
+   * 都靠它把图上那个会动的箭头拿掉，而少一个「光标在哪」的信号就不是这条改动的本意了。
+   */
+  it('presence_screenshot：cursor:false 只说不要箭头，位置照报', async () => {
+    const { world, tools, calls } = build();
+    const host = new FakeHost();
+    host.modelFacts.accepts = () => true;
+    await world.start(host);
+
+    const withArrow = await call(tools.presence_screenshot, { target: 'full' });
+    expect(withArrow.text).toContain('图上那个箭头就是它');
+
+    const without = await call(tools.presence_screenshot, { target: 'full', cursor: false });
+    expect(without.text).toContain('你说了这次不要箭头');
+    expect(without.text).not.toContain('图上那个箭头就是它');
+    expect(without.text).toContain('桌面 (640, 360)'); // 位置照给
+    // 选项真的传下去了（不是 World 自己把箭头藏起来、capture 那边还在画）
+    expect(calls.cursors).toEqual([true, false]);
   });
 
   it('presence_screenshot：能吃图时不说丧气话；hwnd 与 full 都落到对的目标', async () => {

@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { captureScreenshot, describeShotCursor, describeShotGeometry, gridStepFor, listWindows } from '../src/capture.ts';
+import {
+  captureScript,
+  captureScreenshot,
+  describeShotCursor,
+  describeShotGeometry,
+  gridStepFor,
+  listWindows,
+} from '../src/capture.ts';
 
 /** 真截屏与列窗口只在 Windows 桌面会话里跑得动。 */
 const maybe = process.platform === 'win32' ? describe : describe.skip;
@@ -108,16 +115,19 @@ describe('图上的光标（纯函数）', () => {
     expect(text).toContain('图上那个箭头就是它');
   });
 
-  it('没画的四种原因各说各的，她得能分辨是哪一种', () => {
-    const of = (draw: 'hidden' | 'offscreen' | 'printwindow' | 'unknown') =>
+  it('没画的五种原因各说各的，她得能分辨是哪一种', () => {
+    const of = (draw: 'omitted' | 'hidden' | 'offscreen' | 'printwindow' | 'unknown') =>
       describeShotCursor({ captured: cap, cursor: { x: 100, y: 200, draw } });
+    expect(of('omitted')).toContain('你说了这次不要箭头');
+    expect(of('omitted')).toContain('桌面 (100, 200)'); // 不要箭头不等于不要位置
     expect(of('hidden')).toContain('系统这一刻把它藏起来了');
     expect(of('offscreen')).toContain('不在这张图里');
     expect(of('offscreen')).toContain('x=0 y=0');
     expect(of('printwindow')).toContain('窗口自己绘的帧');
     expect(of('unknown')).toContain('没能读出鼠标');
-    expect(new Set([of('hidden'), of('offscreen'), of('printwindow'), of('unknown')]).size).toBe(4);
-    for (const t of [of('hidden'), of('offscreen'), of('printwindow'), of('unknown')]) {
+    const all = [of('omitted'), of('hidden'), of('offscreen'), of('printwindow'), of('unknown')];
+    expect(new Set(all).size).toBe(5);
+    for (const t of all) {
       expect(t).not.toContain('图上那个箭头就是');
     }
   });
@@ -125,6 +135,40 @@ describe('图上的光标（纯函数）', () => {
   it('读不到位置时不编一个坐标出来', () => {
     const text = describeShotCursor({ captured: cap, cursor: { x: null, y: null, draw: 'unknown' } });
     expect(text).not.toMatch(/\d{2,}/);
+  });
+});
+
+/**
+ * 命令行的天花板。
+ *
+ * 这个脚本是**编码成一行塞在命令行上**跑的(`-EncodedCommand`,UTF-16 再 base64 ⇒ 源文本的 2.67 倍)，
+ * 而 Windows 的命令行约 32767 字符。顶过去的表现是 **`spawn ENAMETOOLONG`**——一条完全看不出跟
+ * 「你多写了几行注释」有关的报错(2026-10-07 就是这么红的:往模板里加了段解释,编码后 33003 字节)。
+ *
+ * 为什么不改成「写个临时 .ps1 用 -File 跑」:那正是 `-EncodedCommand` 在这里的理由——**脚本里有中文
+ * (给她的错误文案)**,而无 BOM 的 UTF-8 会被 PowerShell 5.1 按 ANSI 读成乱码。所以脚本必须待在上限之内,
+ * 解释就该写在 TypeScript 这一侧(不花预算)。
+ *
+ * 这条用例把「还剩多少」钉住:谁往模板里加东西,在离上限还有余量的时候就红,而不是运行时炸。
+ */
+describe('截屏脚本的命令行预算（纯函数）', () => {
+  const RESERVE = 2048;
+  const encodedLength = (target: Parameters<typeof captureScript>[0]) => {
+    const candidates = [
+      captureScript(target, true, true),
+      captureScript(target, false, false),
+    ];
+    return Math.max(...candidates.map((s) => Buffer.from(s, 'utf16le').toString('base64').length));
+  };
+
+  it('全屏那条（最长的一份）编码后仍在上限之内，并且留着余量', () => {
+    const encoded = encodedLength({ target: 'full' });
+    expect(32767 - encoded, `命令行还剩 ${32767 - encoded} 字节;注释也算在预算里`).toBeGreaterThan(RESERVE);
+  });
+
+  it('区域那条带上坐标（负数与多位数字）也一样', () => {
+    const encoded = encodedLength({ target: 'region', region: { x: -1234, y: -1234, width: 4321, height: 4321 } });
+    expect(32767 - encoded).toBeGreaterThan(RESERVE);
   });
 });
 
