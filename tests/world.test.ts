@@ -109,6 +109,7 @@ function build(
         via: 'printwindow',
         // 假截屏照真那条的样子：要了格线才报格线（回执那几句是从这里出来的）。
         grid: options?.grid === true ? { step: 100, vertical: 8, horizontal: 6 } : null,
+        cursor: { x: 640, y: 360, draw: 'printwindow' },
         title: '测试窗口',
       };
       return result;
@@ -276,6 +277,7 @@ describe('Presence World', () => {
         downscaled: false,
         via: 'screen' as const,
         grid: null,
+        cursor: { x: 640, y: 360, draw: 'drawn' },
         title: '视频窗口',
       }),
     });
@@ -286,6 +288,8 @@ describe('Presence World', () => {
     expect((first.blobs?.[0] as { mime: string } | undefined)?.mime).toBe('image/jpeg');
     expect(first.text).toContain('JPEG');
     expect(first.text).not.toContain('第 2 张');
+    // 图上那个箭头是什么，跟着图一起回去（这一条用的是抓屏的假截屏）
+    expect(first.text).toContain('图上那个箭头就是它');
     const second = await call(tools.presence_screenshot, {});
     expect(second.text).toContain('第 2 张');
     expect(second.text).toContain('presence_windows');
@@ -362,6 +366,7 @@ describe('Presence World', () => {
           downscaled: false,
           via: 'screen' as const,
           grid: null,
+          cursor: { x: 640, y: 360, draw: 'drawn' },
           title: '',
         }),
       });
@@ -382,6 +387,7 @@ describe('Presence World', () => {
           downscaled: true,
           via: 'screen' as const,
           grid: null,
+          cursor: { x: 640, y: 360, draw: 'drawn' },
           title: '',
         }),
       });
@@ -426,6 +432,7 @@ describe('Presence World', () => {
           downscaled: false,
           via: 'screen' as const,
           grid: null,
+          cursor: { x: 640, y: 360, draw: 'drawn' },
           title: '',
         }),
       });

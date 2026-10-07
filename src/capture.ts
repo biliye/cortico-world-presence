@@ -57,6 +57,22 @@ export interface GridInfo {
   horizontal: number;
 }
 
+/**
+ * 光标有没有画进这张图，没画时是哪一种原因。
+ * `drawn` 画了 / `hidden` 系统这一刻把光标藏起来了（全屏视频、某些程序会这样）/
+ * `offscreen` 光标不在这张图覆盖的那块里 / `printwindow` 这张图不是抓屏来的（窗口自己绘的帧）/
+ * `unknown` 读不到光标在哪。
+ */
+export type CursorDraw = 'drawn' | 'hidden' | 'offscreen' | 'printwindow' | 'unknown';
+
+/** 截图那一刻光标在哪，以及它有没有进这张图。 */
+export interface CursorInfo {
+  /** 桌面物理像素（虚拟屏坐标，与窗口矩形同一个口径）。读不到就是 null，那就也没画。 */
+  x: number | null;
+  y: number | null;
+  draw: CursorDraw;
+}
+
 export interface ScreenshotResult {
   bytes: Buffer;
   /** 实际编码：文字界面存 PNG（无损、字清楚），照片类画面存 JPEG（体积差一个数量级）。 */
@@ -76,6 +92,8 @@ export interface ScreenshotResult {
   title: string;
   /** 图上的格线；没叠就是 null。 */
   grid: GridInfo | null;
+  /** 光标在哪、有没有画进图里（抓屏拍不到光标本身，所以是我们画上去的）。 */
+  cursor: CursorInfo;
 }
 
 /** 截图的可选项。`grid` 叠一层带桌面坐标标注的淡格线（她要从图上读坐标时加它）。 */
@@ -202,6 +220,8 @@ using System.Runtime.InteropServices;
 using System.Text;
 public static class PresenceCap {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  [StructLayout(LayoutKind.Sequential)] public struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public POINT ptScreenPos; }
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
@@ -211,6 +231,13 @@ public static class PresenceCap {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RECT rect, int sizeOfRect);
+  // The pointer itself. A screen grab does not contain the cursor (measured 2026-10-06: a PNG framed
+  // around the pointer has no arrow in it), so a model working from a picture has no other way to
+  // see where the pointer is -- and where the pointer is, is half of "what would a click here hit".
+  [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO info);
+  [DllImport("user32.dll")] public static extern bool DrawIconEx(IntPtr hdc, int xLeft, int yTop, IntPtr hIcon, int cxWidth, int cyWidth, int istepIfAniCur, IntPtr hbrFlickerFreeDraw, int diFlags);
+  // 13 = SM_CXCURSOR, 14 = SM_CYCURSOR: the system cursor's own size at the current DPI.
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
 }
 '@ | Out-Null
   try { [void][PresenceCap]::SetProcessDpiAwareness(2) } catch { try { [void][PresenceCap]::SetProcessDPIAware() } catch {} }
@@ -260,6 +287,25 @@ public static class PresenceCap {
     $bh = $r.Bottom - $r.Top
     if ($w -le 0 -or $bh -le 0) { throw '拿不到窗口尺寸' }
     $rect = @{ x = $r.Left; y = $r.Top; w = $w; h = $bh }
+  }
+
+  # The pointer, read BEFORE the grab: whichever instant the frame carries, the sample closest to
+  # it is the honest one, and reading it here keeps this in one place instead of once per branch.
+  $curOk = $false
+  $curX = 0
+  $curY = 0
+  $curShown = $false
+  $curIcon = [IntPtr]::Zero
+  $ci = New-Object 'PresenceCap+CURSORINFO'
+  $ci.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($ci)
+  if ([PresenceCap]::GetCursorInfo([ref]$ci)) {
+    $curOk = $true
+    $curX = $ci.ptScreenPos.X
+    $curY = $ci.ptScreenPos.Y
+    $curIcon = $ci.hCursor
+    # CURSORINFO.flags: 1 = CURSOR_SHOWING. The system hides the pointer itself for fullscreen
+    # video and for some apps; drawing one anyway would be inventing something that is not there.
+    $curShown = (($ci.flags -band 1) -ne 0)
   }
 
   $via = ''
@@ -353,6 +399,36 @@ public static class PresenceCap {
     $font.Dispose()
     $gridInfo = @{ step = $step; vertical = $vx; horizontal = $hy }
   }
+  # The pointer, drawn onto the FINISHED image: after the downscale (given its real size scaled down
+  # with everything else it would be a smudge, so it is drawn at a readable size instead) and after
+  # the grid (so no line crosses it). Only for a real screen grab -- PrintWindow returns the window's
+  # own frame, which is not what is on the screen, so a pointer on that would be a lie.
+  $draw = 'unknown'
+  $ipx = $ow / $rect.w
+  $ipy = $oh / $rect.h
+  if (-not $curOk) { $draw = 'unknown' }
+  elseif ($via -eq 'printwindow') { $draw = 'printwindow' }
+  elseif (-not $curShown) { $draw = 'hidden' }
+  else {
+    $curIx = [int][Math]::Round(($curX - $rect.x) * $ipx)
+    $curIy = [int][Math]::Round(($curY - $rect.y) * $ipy)
+    if ($curIx -lt 0 -or $curIy -lt 0 -or $curIx -ge $ow -or $curIy -ge $oh) { $draw = 'offscreen' }
+    else {
+      $curSw = [PresenceCap]::GetSystemMetrics(13)
+      $curSh = [PresenceCap]::GetSystemMetrics(14)
+      if ($curSw -le 0) { $curSw = 32 }
+      if ($curSh -le 0) { $curSh = 32 }
+      $curDw = [int][Math]::Max(16, [Math]::Round($curSw * $ipx))
+      $curDh = [int][Math]::Max(16, [Math]::Round($curSh * $ipy))
+      $g5 = [System.Drawing.Graphics]::FromImage($src)
+      $hdc5 = $g5.GetHdc()
+      # 3 = DI_NORMAL (draw the icon and its mask). The handle is the system's own -- never destroyed
+      # here, because it belongs to the desktop, not to us.
+      if ([PresenceCap]::DrawIconEx($hdc5, $curIx, $curIy, $curIcon, $curDw, $curDh, 0, [IntPtr]::Zero, 3)) { $draw = 'drawn' }
+      $g5.ReleaseHdc($hdc5)
+      $g5.Dispose()
+    }
+  }
   $pngMs = New-Object System.IO.MemoryStream
   $src.Save($pngMs, [System.Drawing.Imaging.ImageFormat]::Png)
   $pngBytes = $pngMs.ToArray()
@@ -371,7 +447,7 @@ public static class PresenceCap {
   $src.Dispose()
   $b64 = [Convert]::ToBase64String($bytes)
   $captured = @{ x = $rect.x; y = $rect.y; width = $rect.w; height = $rect.h }
-  Out-Json @{ ok = $true; data = $b64; format = $format; bytes = $bytes.Length; width = $ow; height = $oh; captured = $captured; downscaled = $downscaled; via = $via; title = $title; grid = $gridInfo }
+  Out-Json @{ ok = $true; data = $b64; format = $format; bytes = $bytes.Length; width = $ow; height = $oh; captured = $captured; downscaled = $downscaled; via = $via; title = $title; grid = $gridInfo; cursor = @{ x = $(if ($curOk) { $curX } else { $null }); y = $(if ($curOk) { $curY } else { $null }); draw = $draw } }
 } catch {
   Out-Json @{ ok = $false; error = $_.Exception.Message }
 }
@@ -551,7 +627,27 @@ export async function captureScreenshot(
     via: result.via === 'printwindow' ? 'printwindow' : 'screen',
     title: typeof result.title === 'string' ? result.title : '',
     grid: parseGrid(result.grid),
+    cursor: parseCursor(result.cursor),
   };
+}
+
+/** 脚本报回来的光标信息。形状不对就当「读不到」——宁可少说一句，也不报一个假的位置。 */
+function parseCursor(raw: unknown): CursorInfo {
+  const c = (raw ?? {}) as Record<string, unknown>;
+  const x = numOrNull(c.x);
+  const y = numOrNull(c.y);
+  if (x === null || y === null) return { x: null, y: null, draw: 'unknown' };
+  const draw =
+    c.draw === 'drawn' || c.draw === 'hidden' || c.draw === 'offscreen' || c.draw === 'printwindow'
+      ? c.draw
+      : 'unknown';
+  return { x, y, draw };
+}
+
+function numOrNull(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return Math.round(v);
+  if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Math.round(Number(v));
+  return null;
 }
 
 /** 脚本报回来的格线信息。形状不对就当没叠（宁可少说一句，也不报一个假的间距）。 */
@@ -618,6 +714,30 @@ export function describeShotGeometry(
     );
   }
   return lines.join('\n');
+}
+
+/**
+ * 「图上那个箭头是什么」——**跟图一起回去**的那句话。
+ *
+ * 抓屏本身拍不到光标（量过：围着光标的 PNG 里没有箭头），所以图上的光标是我们照着系统的真光标
+ * 画上去的。这一句要把「它到底在不在图上」说清：没画的时候，她不该读成「光标不在这块」，
+ * 更不该读成「这个功能坏了」。
+ */
+export function describeShotCursor(result: Pick<ScreenshotResult, 'cursor' | 'captured'>): string {
+  const c = result.cursor;
+  const at = c.x === null || c.y === null ? '桌面某处' : `桌面 (${c.x}, ${c.y})`;
+  switch (c.draw) {
+    case 'drawn':
+      return `鼠标在 ${at}：**图上那个箭头就是它**（抓屏抓不到光标本身，箭头是我照系统当前的样子画上去的）。`;
+    case 'hidden':
+      return `鼠标在 ${at}，但**系统这一刻把它藏起来了**（全屏视频、有些程序会自己隐藏指针），所以在图上没有箭头。`;
+    case 'offscreen':
+      return `鼠标在 ${at}，**不在这张图里**（这张图只覆盖 x=${result.captured.x} y=${result.captured.y} 那一块），所以图上没有箭头。`;
+    case 'printwindow':
+      return '这张图是窗口自己绘的帧（不是抓屏），所以上面**没有**鼠标箭头——这不代表光标不在那一块。';
+    default:
+      return '这一次没能读出鼠标在哪，所以图上没有箭头。';
+  }
 }
 
 /** 一个对象也可能是 ConvertTo-Json 把单元素数组拍平的结果，兜一下。 */

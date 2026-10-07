@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import {
   SCREENSHOT_MAX_EDGE,
   captureScreenshot,
+  describeShotCursor,
   describeShotGeometry,
   listWindows,
   parseRegion,
@@ -391,7 +392,9 @@ export class PresenceWorld implements World {
         '(1) give x/y/width/height to capture exactly that region — use the rectangles from presence_windows; ' +
         '(2) give a hwnd to capture that whole window; (3) give target "foreground" (default) or "full". ' +
         'Regions under the size cap come back at native pixels, so a SMALL region is how you read small text: ' +
-        'framing tighter beats framing wider. Only call this when you actually want to look; the picture rides ' +
+        'framing tighter beats framing wider. The mouse pointer is drawn onto the picture (a screen grab does ' +
+        'not contain the cursor) and its desktop position is in the receipt. ' +
+        'Only call this when you actually want to look; the picture rides ' +
         'along with every later request until it falls out of your context, so for "what is he doing" over time ' +
         'presence_windows is far cheaper.',
       tags: ['read'],
@@ -493,6 +496,9 @@ export class PresenceWorld implements World {
       lines.push(`（这块比 ${SCREENSHOT_MAX_EDGE} 像素的上限大，所以被压过——想看清小字就把框框小一点，小框是按原始像素给的。）`);
     }
     for (const line of describeShotGeometry(result).split('\n')) lines.push(line);
+    // 光标在不在图上、没画是为什么——同样跟图一起回去。图上没有箭头的时候，「光标不在这块」
+    // 和「这次没读出来」是两件完全不同的事，她不该靠猜。
+    lines.push(describeShotCursor(result));
 
     if (target.target === 'region') {
       const change = this.noteRegionChange(cap, result.bytes);
@@ -580,7 +586,8 @@ export class PresenceWorld implements World {
 
   /**
    * 同一块区域的前后对比：只比字节，完全相同就是像素级没变。
-   * 时钟、光标、滚动条这类一直在动的东西会让它永远报「有变化」——回执里说明了这点。
+   * 时钟、视频、滚动条这类一直在动的东西会让它永远报「有变化」——回执里说明了这点。
+   * 图上的鼠标箭头也算在内（那是我们画上去的），所以光标挪到框里来过一次，这块就「有变化」。
    */
   private noteRegionChange(cap: Rect, bytes: Buffer): string {
     const key = `${cap.x},${cap.y},${cap.width},${cap.height}`;
@@ -594,7 +601,7 @@ export class PresenceWorld implements World {
     if (before === undefined) return '（这是本次运行第一次看这块。）';
     return before === hash
       ? '（和上次看这块一样：像素级完全相同。）'
-      : '（和上次看这块比：有变化。时钟、光标这类一直在动的东西也会让它显示有变化。）';
+      : '（和上次看这块比：有变化。时钟、视频这类一直在动的东西会让它变——鼠标也是，图上那个箭头就是它。）';
   }
 
   // ——— 事件与状态 ———
