@@ -5,13 +5,16 @@
  * 投递姿势握在 bot 手里，是运行态、**不写回配置**（hearing 同款约定）。四挡（2026-10-13 加的后两挡、
  * 并把默认从 ambient 换成 digest——开发者当天定的）：
  * - digest（压缩，**默认**）：窗口变化只进账本、**不单独投**，到周期（默认 20 分钟）折成一份时间线
- *   摘要投出——「同一批里重复的折成一条、只留在哪几个窗口之间来回」。离开/回来除外，照旧当场叫醒，
- *   同时也记进摘要那一段；
+ *   摘要投出——「同一批里重复的折成一条、只留在哪几个窗口之间来回」。回来（back）照旧当场叫醒，
+ *   同时也记进摘要那一段；**离开（away）只投、不叫醒**（见下）；
  * - ambient：窗口变化攒成批，随她下次开口一起进上下文，不叫醒她；
  * - call：变化当场投、叫醒她，3 秒内的连续变化并成一条，免得一次 alt-tab 双响；
- * - off（关闭）：窗口变化只进账本、不主动投，**只放行两条**——离开/回来（当场叫醒），
+ * - off（关闭）：窗口变化只进账本、不主动投，**只放行两样**——回来（当场叫醒）与离开（只投、不叫醒），
  *   以及切到一个「本次运行第一次见到的程序」（报一行，不叫醒）。她主动调 presence_windows
  *   时账本照给。
+ *
+ * **「离开」不叫醒**（2026-10-13 他定的，四挡通用）：他离开时她通常没什么可做的，那条不值得打断她；
+ * 事件照投（piggyback），随她下次开口一起到。「回来」照旧——ambient 那挡不叫醒，其余三挡当场叫醒。
  *
  * 「关闭」是**投递静音，不是关掉这个世界**：传感器照采、两个工具照用，跟配置里的
  * `enabled:false`（整个 World 不启动）是两码事，提示词里点明了。
@@ -276,8 +279,9 @@ export class PresenceWorld implements World {
    * 离开 / 回来。四挡下都投**自己的事件名**（`presence.away` / `presence.back`）——不再混进
    * 窗口变化的批里。从前那条路会把单独一条离开错标成 `presence.switched`，2026-10-13 顺手修掉。
    *
-   * 叫不叫醒按挡位：ambient 那一挡的脾气是不叫醒（跟它攒批一致），其余三挡当场叫醒。
-   * 压缩挡下这段离开还进摘要——时间线才完整（她 2026-10-13 定的）。
+   * 叫醒规则（2026-10-13 他定的）：**「离开」不叫醒**（四挡通用）——他离开时她通常没什么可做的，
+   * 那条不值得打断她；事件照投，只是 piggyback。「回来」按挡位：ambient 不叫醒，其余三挡当场叫醒。
+   * 压缩挡下这段离开还进摘要——时间线才完整。
    */
   private onAway(kind: 'away' | 'back', now: number): void {
     const text =
@@ -286,7 +290,7 @@ export class PresenceWorld implements World {
         : `[${clock(now)}] 回到键盘，离开了 ${fmtDuration(now - this.awaySinceMs)}`;
     // 「回来」那一刻把这段离开封进账本；「离开」那一刻不用记，起点就是现在。
     if (this.delivery === 'digest' && kind === 'back') this.closeAwaySegment(this.awaySinceMs, now);
-    const trigger: TriggerMode = this.delivery === 'ambient' ? 'piggyback' : 'flush';
+    const trigger: TriggerMode = kind === 'away' || this.delivery === 'ambient' ? 'piggyback' : 'flush';
     void this.emit(kind === 'away' ? 'presence.away' : 'presence.back', text, trigger);
   }
 

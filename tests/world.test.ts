@@ -588,7 +588,7 @@ describe('Presence World', () => {
       expect(host.events).toEqual([]); // 结账走的是回执，不是事件
     });
 
-    it('digest：离开/回来当场叫醒，同时记进摘要', async () => {
+    it('digest：离开只投不叫醒、回来当场叫醒，两条都记进摘要', async () => {
       const { world, host, sensor, tools } = build({}, { awayAfterMs: 100 });
       await world.start(host);
       await call(tools.presence_set_mode, { mode: 'digest', minutes: 20 });
@@ -598,7 +598,8 @@ describe('Presence World', () => {
       sensor.tick(50, WIN_A); // 回来
       await sleep(20);
       expect(host.events.map((e) => e.type)).toEqual(['presence.away', 'presence.back']);
-      expect(host.pushOpts.every((o) => o?.trigger === 'flush')).toBe(true); // 都叫醒
+      expect(host.pushOpts[0]?.trigger).toBe('piggyback'); // 离开不叫醒
+      expect(host.pushOpts[1]?.trigger).toBe('flush'); // 回来叫醒
       const out = await call(tools.presence_windows);
       expect(out.text).toContain('离开键盘'); // 那段也进了摘要
     });
@@ -642,15 +643,35 @@ describe('Presence World', () => {
       expect(host.events).toEqual([]);
     });
 
-    it('off：离开/回来当场投并叫醒', async () => {
+    it('off：离开只投不叫醒、回来叫醒', async () => {
       const { world, host, sensor, tools } = build({}, { awayAfterMs: 100 });
       await world.start(host);
       await call(tools.presence_set_mode, { mode: 'off' });
       sensor.tick(50, WIN_A);
-      sensor.tick(200, WIN_A);
+      sensor.tick(200, WIN_A); // 离开
       await sleep(20);
       expect(host.events.map((e) => e.type)).toEqual(['presence.away']);
-      expect(host.pushOpts[0]?.trigger).toBe('flush');
+      expect(host.pushOpts[0]?.trigger).toBe('piggyback');
+      sensor.tick(50, WIN_A); // 回来
+      await sleep(20);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.away', 'presence.back']);
+      expect(host.pushOpts[1]?.trigger).toBe('flush');
+    });
+
+    it('「离开」不叫醒是四挡通用——连 call 挡也不叫醒（「回来」照旧）', async () => {
+      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100 });
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'call' });
+      sensor.tick(50, WIN_A);
+      await sleep(5);
+      sensor.tick(200, WIN_A); // 离开
+      await sleep(20);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.away']);
+      expect(host.pushOpts[0]?.trigger).toBe('piggyback');
+      sensor.tick(50, WIN_A); // 回来
+      await sleep(20);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.away', 'presence.back']);
+      expect(host.pushOpts[1]?.trigger).toBe('flush');
     });
 
     it('off：presence_windows 把关闭期间的变化给出来（只留档、不主动投）', async () => {
