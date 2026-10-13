@@ -2,13 +2,13 @@
  * Presence World：给 bot 「在场感」——前台窗口变化、离开/回来键盘，加上按需的
  * 窗口清单（presence_windows）与截图（presence_screenshot）。
  *
- * 投递姿势握在 bot 手里，是运行态、**不写回配置**（hearing 同款约定）。四挡（2026-10-13 加的
- * 后两挡，开发者拍的板）：
- * - ambient（默认）：窗口变化攒成批，随她下次开口一起进上下文，不叫醒她；
+ * 投递姿势握在 bot 手里，是运行态、**不写回配置**（hearing 同款约定）。四挡（2026-10-13 加的后两挡、
+ * 并把默认从 ambient 换成 digest——开发者当天定的）：
+ * - digest（压缩，**默认**）：窗口变化只进账本、**不单独投**，到周期（默认 20 分钟）折成一份时间线
+ *   摘要投出——「同一批里重复的折成一条、只留在哪几个窗口之间来回」。离开/回来除外，照旧当场叫醒，
+ *   同时也记进摘要那一段；
+ * - ambient：窗口变化攒成批，随她下次开口一起进上下文，不叫醒她；
  * - call：变化当场投、叫醒她，3 秒内的连续变化并成一条，免得一次 alt-tab 双响；
- * - digest（压缩）：窗口变化只进账本、**不单独投**，到周期（默认 20 分钟）折成一份时间线
- *   摘要投出——「同一批里重复的折成一条、只留在哪几个窗口之间来回」。离开/回来除外，
- *   照旧当场叫醒，同时也记进摘要那一段；
  * - off（关闭）：窗口变化只进账本、不主动投，**只放行两条**——离开/回来（当场叫醒），
  *   以及切到一个「本次运行第一次见到的程序」（报一行，不叫醒）。她主动调 presence_windows
  *   时账本照给。
@@ -97,7 +97,8 @@ export class PresenceWorld implements World {
   private sensor: PresenceSensor | null = null;
   private state: 'idle' | 'starting' | 'watching' | 'failed' = 'idle';
   private lastError = '';
-  private delivery: Delivery = 'ambient';
+  /** 挂着的那一挡。默认 digest（压缩）——2026-10-13 他定的。重启回这里。 */
+  private delivery: Delivery = 'digest';
   /** 最近一次采样的前台窗口；null 表示还没见过（或桌面没有前台）。 */
   private current: SensorWindow | null = null;
   private currentSinceMs = 0;
@@ -196,7 +197,9 @@ export class PresenceWorld implements World {
       });
       this.state = 'watching';
       this.lastError = '';
-      log.info('开始看桌面', { pollIntervalMs: pollMs });
+      // 默认挡是 digest：账本与周期计时器得在这儿就支起来——不然窗口变化只封空账、摘要永远不投。
+      this.armDelivery(this.delivery, Date.now());
+      log.info('开始看桌面', { pollIntervalMs: pollMs, delivery: this.delivery });
     } catch (err) {
       this.state = 'failed';
       this.lastError = describe(err);
@@ -341,6 +344,18 @@ export class PresenceWorld implements World {
     this.ledger = [];
     this.ledgerStartMs = now;
     return { segments, from };
+  }
+
+  /**
+   * 进入一个挡位：账本从这一刻起算，压缩挡还要把周期计时器支起来。
+   * **start() 与 setMode() 共用**——默认挡是 digest，启动时这一句不做，压缩挡就等于空转。
+   */
+  private armDelivery(mode: Delivery, now: number): void {
+    this.delivery = mode;
+    this.ledger = [];
+    this.ledgerStartMs = mode === 'digest' || mode === 'off' ? now : 0;
+    this.clearDigestTimer();
+    if (mode === 'digest') this.armDigestTimer();
   }
 
   /** 投出一份压缩摘要，然后重开一个周期。账本是空的（没采到东西）就不投，别制造噪音。 */
@@ -701,16 +716,16 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_set_mode',
       description:
-        'Choose how screen activity reaches you. "ambient": changes accumulate into merged batches that queue ' +
-        'without waking you (default). "call": every change is delivered immediately and wakes you, with changes ' +
-        'within 3 seconds merged. "digest": window changes only go into a ledger and are folded into ONE timeline ' +
-        'summary per period (default 20 minutes; pass minutes to change it) — repeats collapse into "back and forth ' +
-        'between X and Y", so you learn where he spent time, not every single switch; leaving/returning still comes ' +
-        'through immediately and also lands in that summary. "off": window activity is kept only for when you ask ' +
+        'Choose how screen activity reaches you. "digest" (default): window changes only go into a ledger and are ' +
+        'folded into ONE timeline summary per period (default 20 minutes; pass minutes to change it) — repeats ' +
+        'collapse into "back and forth between X and Y", so you learn where he spent time, not every single switch; ' +
+        'leaving/returning still comes through immediately and also lands in that summary. "ambient": changes ' +
+        'accumulate into merged batches that queue without waking you. "call": every change is delivered immediately ' +
+        'and wakes you, with changes within 3 seconds merged. "off": window activity is kept only for when you ask ' +
         '(presence_windows), and only two things are ever delivered on their own — leaving/returning (wakes you) and ' +
         'switching to a program not seen yet this run (does not wake you). "off" is a delivery mute, NOT shutting the ' +
         'World down: the sensor keeps running and both tools still work. Runtime-only: restarting this World goes ' +
-        'back to "ambient".',
+        'back to "digest".',
       tags: ['act'],
       parameters: {
         type: 'object',
@@ -778,13 +793,10 @@ export class PresenceWorld implements World {
     }
     if (mode === 'digest' || mode === 'off') await this.flushAmbient('piggyback');
 
-    this.delivery = mode;
     this.digestMinutes = minutes;
+    this.armDelivery(mode, now);
 
     if (mode === 'digest') {
-      this.ledger = [];
-      this.ledgerStartMs = now;
-      this.armDigestTimer();
       return {
         text:
           `已切到 digest（压缩）：窗口变化只记账、不单独投；每 ${fmtMinutes(minutes)}折成一份时间线摘要给你（不叫醒）。` +
@@ -792,8 +804,6 @@ export class PresenceWorld implements World {
       };
     }
     if (mode === 'off') {
-      this.ledger = [];
-      this.ledgerStartMs = now;
       return {
         text:
           '已切到 off（关闭）：窗口活动只留档、不主动投。只有两样会自己冒出来——「你离开/回来」（叫醒你），' +

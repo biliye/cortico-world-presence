@@ -159,9 +159,24 @@ describe('Presence World', () => {
     expect(host.events).toEqual([]);
   });
 
-  it('ambient（默认）下窗口变化攒着，stop 时合成一条 piggyback 投出', async () => {
-    const { world, host, sensor } = build();
+  it('默认挡就是 digest：启动即记账，窗口变化不单独投；presence_windows 当场给一份结账', async () => {
+    const { world, host, sensor, tools } = build();
     await world.start(host);
+    sensor.tick(100, WIN_A);
+    await sleep(5);
+    sensor.tick(100, WIN_B);
+    await sleep(20);
+    expect(host.events).toEqual([]); // 默认不再「一有变化就攒批投出」
+    const out = await call(tools.presence_windows);
+    expect(out.text).toContain('digest（压缩）');
+    expect(out.text).toContain('[压缩结账]');
+    expect(out.text).toContain('「main.ts - 编辑器」');
+  });
+
+  it('ambient 挡下窗口变化攒着，stop 时合成一条 piggyback 投出', async () => {
+    const { world, host, sensor, tools } = build();
+    await world.start(host);
+    await call(tools.presence_set_mode, { mode: 'ambient' });
     sensor.tick(100, WIN_A); // 打底
     sensor.tick(100, WIN_B); // 变化
     await sleep(20);
@@ -176,8 +191,9 @@ describe('Presence World', () => {
   });
 
   it('ambient 的批到时限就投，不等下一条变化', async () => {
-    const { world, host, sensor } = build({ ambientFlushMs: 50 });
+    const { world, host, sensor, tools } = build({ ambientFlushMs: 50 });
     await world.start(host);
+    await call(tools.presence_set_mode, { mode: 'ambient' });
     sensor.tick(100, WIN_A);
     sensor.tick(100, WIN_B);
     await sleep(120);
@@ -229,6 +245,7 @@ describe('Presence World', () => {
   it('presence_windows：回执有前台、空闲、窗口清单，变化段当场给并清空攒批', async () => {
     const { world, host, sensor, tools, calls } = build();
     await world.start(host);
+    await call(tools.presence_set_mode, { mode: 'ambient' });
     sensor.tick(5000, WIN_A);
     sensor.tick(5000, WIN_B); // 一条变化，攒着
     const out = await call(tools.presence_windows);
@@ -498,6 +515,7 @@ describe('Presence World', () => {
   it('set_mode 是运行态：切到 call 把攒的立即投出（flush），再切回来改走攒批', async () => {
     const { world, host, sensor, tools } = build();
     await world.start(host);
+    await call(tools.presence_set_mode, { mode: 'ambient' });
     sensor.tick(100, WIN_A);
     sensor.tick(100, WIN_B); // ambient 攒着一条
     const out = await call(tools.presence_set_mode, { mode: 'call' });
@@ -512,14 +530,16 @@ describe('Presence World', () => {
   it('重复 set_mode 不动、不投', async () => {
     const { world, host, tools } = build();
     await world.start(host);
+    await call(tools.presence_set_mode, { mode: 'ambient' });
     const out = await call(tools.presence_set_mode, { mode: 'ambient' });
     expect(out.text).toContain('没动');
     expect(host.events).toEqual([]);
   });
 
   it('stop 把传感器停掉，把攒的按不叫醒投出', async () => {
-    const { world, host, sensor } = build();
+    const { world, host, sensor, tools } = build();
     await world.start(host);
+    await call(tools.presence_set_mode, { mode: 'ambient' });
     sensor.tick(100, WIN_A);
     sensor.tick(100, WIN_B);
     await world.stop();
