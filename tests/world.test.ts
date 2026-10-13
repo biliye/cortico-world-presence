@@ -527,4 +527,149 @@ describe('Presence World', () => {
     expect(host.events.map((e) => e.type)).toEqual(['presence.activity']);
     expect(host.pushOpts[0]?.trigger).toBe('piggyback');
   });
+
+  /**
+   * 2026-10-13 加的两挡：digest（压缩）与 off（关闭）。
+   * 开发者拍的板：关闭挡「只报没见过的窗口」按**程序名**去重、本次运行内算新；
+   * 压缩挡周期默认 20 分钟可临时调；离开/回来在压缩挡里当场叫醒且也记进摘要。
+   */
+  describe('压缩挡（digest）与关闭挡（off）', () => {
+    it('digest：窗口变化不单独投，周期到了才折成一份摘要（不叫醒）', async () => {
+      const { world, host, sensor, tools } = build();
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'digest', minutes: 0.02 }); // 1.2 秒一轮
+      sensor.tick(100, WIN_A);
+      await sleep(5);
+      sensor.tick(100, WIN_B);
+      await sleep(5);
+      sensor.tick(100, WIN_A);
+      await sleep(30);
+      expect(host.events).toEqual([]); // 周期没到，一条都不投
+      await sleep(1500);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.digest']);
+      expect(host.pushOpts[0]?.trigger).toBe('piggyback');
+      expect(host.events[0].text).toContain('[压缩');
+      expect(host.events[0].text).toContain('「main.ts - 编辑器」');
+      expect(host.events[0].origin).toBe('external');
+    });
+
+    it('digest：presence_windows 就是「结账」——当场给时间线并重开周期', async () => {
+      const { world, host, sensor, tools } = build();
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'digest', minutes: 20 });
+      sensor.tick(100, WIN_A);
+      await sleep(5); // 段长要 > 0，零长的段会被当脏数据丢掉
+      sensor.tick(100, WIN_B);
+      await sleep(5);
+      const out = await call(tools.presence_windows);
+      expect(out.text).toContain('digest（压缩）');
+      expect(out.text).toContain('[压缩结账]');
+      expect(out.text).toContain('「main.ts - 编辑器」');
+      expect(host.events).toEqual([]); // 结账走的是回执，不是事件
+    });
+
+    it('digest：离开/回来当场叫醒，同时记进摘要', async () => {
+      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100 });
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'digest', minutes: 20 });
+      sensor.tick(50, WIN_A);
+      sensor.tick(200, WIN_A); // 离开
+      await sleep(20);
+      sensor.tick(50, WIN_A); // 回来
+      await sleep(20);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.away', 'presence.back']);
+      expect(host.pushOpts.every((o) => o?.trigger === 'flush')).toBe(true); // 都叫醒
+      const out = await call(tools.presence_windows);
+      expect(out.text).toContain('离开键盘'); // 那段也进了摘要
+    });
+
+    it('digest：周期可临时调，非法值被拒，重复设置不动', async () => {
+      const { world, host, tools } = build();
+      await world.start(host);
+      const bad = await call(tools.presence_set_mode, { mode: 'digest', minutes: 0 });
+      expect(bad.failed).toBe(true);
+      const ok = await call(tools.presence_set_mode, { mode: 'digest', minutes: 5 });
+      expect(ok.text).toContain('5 分钟');
+      const same = await call(tools.presence_set_mode, { mode: 'digest', minutes: 5 });
+      expect(same.text).toContain('没动');
+      const shorter = await call(tools.presence_set_mode, { mode: 'digest', minutes: 2 });
+      expect(shorter.text).toContain('2 分钟');
+    });
+
+    it('off：窗口变化不投，只报「本次运行第一次见到的程序」一行（不叫醒）', async () => {
+      const { world, host, sensor, tools } = build();
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'off' });
+      sensor.tick(100, WIN_A); // 打底：收养 chrome
+      sensor.tick(100, WIN_B); // code 第一次见 → 报一行
+      await sleep(20);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.switched']);
+      expect(host.pushOpts[0]?.trigger).toBe('piggyback');
+      expect(host.events[0].text).toContain('第一次见到这个程序');
+      sensor.tick(100, WIN_A); // chrome 见过 → 不报
+      sensor.tick(100, WIN_C); // wezterm 第一次见 → 再报一行
+      await sleep(20);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.switched', 'presence.switched']);
+    });
+
+    it('off：同一个程序换个窗口标题不算「新」', async () => {
+      const { world, host, sensor, tools } = build();
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'off' });
+      sensor.tick(100, WIN_A); // chrome
+      sensor.tick(100, { ...WIN_A, hwnd: 99, title: '另一个标签 - Google Chrome' });
+      await sleep(20);
+      expect(host.events).toEqual([]);
+    });
+
+    it('off：离开/回来当场投并叫醒', async () => {
+      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100 });
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'off' });
+      sensor.tick(50, WIN_A);
+      sensor.tick(200, WIN_A);
+      await sleep(20);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.away']);
+      expect(host.pushOpts[0]?.trigger).toBe('flush');
+    });
+
+    it('off：presence_windows 把关闭期间的变化给出来（只留档、不主动投）', async () => {
+      const { world, host, sensor, tools } = build();
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'off' });
+      sensor.tick(100, WIN_A);
+      await sleep(5);
+      sensor.tick(100, WIN_B);
+      await sleep(5);
+      const out = await call(tools.presence_windows);
+      expect(out.text).toContain('[关闭期间的变化]');
+      expect(out.text).toContain('「main.ts - 编辑器」');
+      // 关闭挡下窗口变化本身不投；这一条是「第一次见到的程序」（code）自己冒出来的那一行
+      expect(host.events.map((e) => e.type)).toEqual(['presence.switched']);
+    });
+
+    it('离开/回来投的是自己的事件名，不再混进 activity 批（顺手修的老毛病）', async () => {
+      const { world, host, sensor } = build({}, { awayAfterMs: 100 });
+      await world.start(host);
+      sensor.tick(50, WIN_A);
+      sensor.tick(200, WIN_A); // 离开
+      await sleep(20);
+      sensor.tick(50, WIN_A); // 回来
+      await sleep(20);
+      expect(host.events.map((e) => e.type)).toEqual(['presence.away', 'presence.back']);
+    });
+
+    it('切挡不丢账：从 digest 切走时把本周期摘要投出', async () => {
+      const { world, host, sensor, tools } = build();
+      await world.start(host);
+      await call(tools.presence_set_mode, { mode: 'digest', minutes: 20 });
+      sensor.tick(100, WIN_A);
+      await sleep(5);
+      sensor.tick(100, WIN_B);
+      await sleep(5);
+      await call(tools.presence_set_mode, { mode: 'ambient' });
+      expect(host.events.map((e) => e.type)).toEqual(['presence.digest']);
+      expect(host.pushOpts[0]?.trigger).toBe('piggyback');
+    });
+  });
 });

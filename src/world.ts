@@ -2,9 +2,19 @@
  * Presence World：给 bot 「在场感」——前台窗口变化、离开/回来键盘，加上按需的
  * 窗口清单（presence_windows）与截图（presence_screenshot）。
  *
- * 投递姿势握在 bot 手里，是运行态、**不写回配置**（hearing 同款约定）：
- * - ambient（默认）：变化攒成批，随她下次开口一起进上下文，不叫醒她；
- * - call：变化当场投、叫醒她，3 秒内的连续变化并成一条，免得一次 alt-tab 双响。
+ * 投递姿势握在 bot 手里，是运行态、**不写回配置**（hearing 同款约定）。四挡（2026-10-13 加的
+ * 后两挡，开发者拍的板）：
+ * - ambient（默认）：窗口变化攒成批，随她下次开口一起进上下文，不叫醒她；
+ * - call：变化当场投、叫醒她，3 秒内的连续变化并成一条，免得一次 alt-tab 双响；
+ * - digest（压缩）：窗口变化只进账本、**不单独投**，到周期（默认 20 分钟）折成一份时间线
+ *   摘要投出——「同一批里重复的折成一条、只留在哪几个窗口之间来回」。离开/回来除外，
+ *   照旧当场叫醒，同时也记进摘要那一段；
+ * - off（关闭）：窗口变化只进账本、不主动投，**只放行两条**——离开/回来（当场叫醒），
+ *   以及切到一个「本次运行第一次见到的程序」（报一行，不叫醒）。她主动调 presence_windows
+ *   时账本照给。
+ *
+ * 「关闭」是**投递静音，不是关掉这个世界**：传感器照采、两个工具照用，跟配置里的
+ * `enabled:false`（整个 World 不启动）是两码事，提示词里点明了。
  *
  * 有意不做的事：不监视键盘/剪贴板内容（只有空闲时长，永远没有内容）；不做定时截图
  * （开发者定的：截图只在她主动要时发生）；不做应用黑名单（开发者 2026-09-19 知情拍板
@@ -38,6 +48,7 @@ import {
   type WindowList,
 } from './capture.ts';
 import { PRESENCE_CONFIG_GROUP, type PresenceConfigSection } from './config.ts';
+import { clock, fmtDuration, renderDigest, renderSegmentLines, type DigestSegment } from './digest.ts';
 import { spawnSensor, type PresenceSensor, type SensorTick, type SensorWindow } from './sensor.ts';
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
@@ -48,6 +59,10 @@ const AMBIENT_FLUSH_CHARS = 1200;
 const AMBIENT_FLUSH_MS = 180_000;
 /** call 模式下窗口变化的合并窗口：3 秒内的连续变化并成一条再叫醒。 */
 const CALL_COALESCE_MS = 3000;
+/** 压缩挡的周期默认值（分钟）；她可以在 presence_set_mode 里带一个数临时覆盖。 */
+const DIGEST_DEFAULT_MINUTES = 20;
+/** 账本最多留多少段（digest / off 两挡共用），超了丢最老的。 */
+const LEDGER_MAX_SEGMENTS = 400;
 /** pollIntervalMs 的下限：再密就是拿 token 换分辨率，且 PowerShell 起一轮也有成本。 */
 const MIN_POLL_MS = 2000;
 /** 窗口清单回执最多列多少行，剩下的报个数。 */
@@ -73,7 +88,7 @@ export interface PresenceWorldOptions {
   callCoalesceMs?: number;
 }
 
-type Delivery = 'ambient' | 'call';
+type Delivery = 'ambient' | 'call' | 'digest' | 'off';
 
 export class PresenceWorld implements World {
   readonly id = 'presence';
@@ -91,6 +106,15 @@ export class PresenceWorld implements World {
   private away = false;
   private awaySinceMs = 0;
   private switchCount = 0;
+  /** digest / off 两挡共用的段账本：已闭合的段落在这里，当前那个窗口还开着不记账本。 */
+  private ledger: DigestSegment[] = [];
+  /** 账本的起点（进 digest / off 挡的时刻）。0 = 现在没有账本。 */
+  private ledgerStartMs = 0;
+  /** 压缩挡的周期计时器与当前周期长度（分钟）。 */
+  private digestTimer: ReturnType<typeof setTimeout> | null = null;
+  private digestMinutes = DIGEST_DEFAULT_MINUTES;
+  /** 关闭挡的「见过」集合：本次运行报过一行窗口切换的程序名（按程序名去重，重启清零）。 */
+  private seenExe = new Set<string>();
   /** call 模式下等合并的变化行。 */
   private pendingSwitchLines: string[] = [];
   private switchTimer: ReturnType<typeof setTimeout> | null = null;
@@ -129,11 +153,11 @@ export class PresenceWorld implements World {
     return {
       lamps: [this.lamp()],
       badges: [
-        { label: '姿势', value: this.delivery === 'call' ? '即投' : '攒批', tone: 'plain' as const },
+        { label: '姿势', value: deliveryLabel(this.delivery), tone: 'plain' as const },
         { label: '前台', value: this.current ? ellipsis(this.current.title) || this.current.exe || '—' : '—', tone: 'plain' as const },
         { label: '空闲', value: this.idleMs < 0 ? '—' : fmtDuration(this.idleMs), tone: 'plain' as const },
         { label: '已记录变化', value: `${this.switchCount} 次`, tone: 'plain' as const },
-        { label: '攒着没投', value: `${this.ambientLines.length + this.pendingSwitchLines.length} 条`, tone: 'plain' as const },
+        { label: '攒着没投', value: `${this.ambientLines.length + this.pendingSwitchLines.length + this.ledger.length} 条`, tone: 'plain' as const },
       ],
       config: [PRESENCE_CONFIG_GROUP],
       promptDocs: [
@@ -186,10 +210,19 @@ export class PresenceWorld implements World {
     this.sensor = null;
     sensor?.stop();
     this.clearSwitchTimer();
+    this.clearDigestTimer();
     // call 模式攒着的合并行并进 ambient 批一起投，不丢账。
     this.ambientLines.push(...this.pendingSwitchLines);
     this.pendingSwitchLines = [];
-    await this.flushAmbient('piggyback');
+    if (this.delivery === 'digest') {
+      // 压缩挡的账在另一个本子上：收尾把这一周期的摘要投出去（不叫醒），不丢账。
+      await this.flushDigest('piggyback');
+    } else if (this.delivery !== 'off') {
+      await this.flushAmbient('piggyback');
+    }
+    // off 挡不投，也不留：账本只是「她问就给」的留档，收摊时不该突然冒一条。
+    this.ledger = [];
+    this.ledgerStartMs = 0;
     this.state = 'idle';
     this.current = null;
     this.idleMs = -1;
@@ -209,10 +242,10 @@ export class PresenceWorld implements World {
     if (!this.away && tick.idleMs >= threshold) {
       this.away = true;
       this.awaySinceMs = now;
-      this.deliver(`[${clock(now)}] 离开键盘`, log);
+      this.onAway('away', now);
     } else if (this.away && tick.idleMs < threshold) {
       this.away = false;
-      this.deliver(`[${clock(now)}] 回到键盘，离开了 ${fmtDuration(now - this.awaySinceMs)}`, log);
+      this.onAway('back', now);
     }
 
     // 前台窗口变化：与上次采样对比。第一回只打底（current 为空时收养，不报事件），
@@ -222,11 +255,117 @@ export class PresenceWorld implements World {
     const prev = this.current;
     if (prev && sameWindow(cur, prev)) return;
     const dwellMs = prev ? now - this.currentSinceMs : 0;
+    // digest / off 两挡走账本：刚结束的这段先封口（起点不早于进挡那一刻）。
+    if (prev && (this.delivery === 'digest' || this.delivery === 'off')) {
+      this.closeSegment(prev, this.currentSinceMs, now);
+    }
     this.current = cur;
     this.currentSinceMs = now;
     if (prev) {
       this.switchCount += 1;
-      this.deliver(renderSwitch(cur, prev, dwellMs, now), log);
+      this.onSwitch(cur, prev, dwellMs, now, log);
+    } else {
+      this.seenExe.add(exeKey(cur)); // 第一眼收养：它也算「见过」，切回来时不该算新
+    }
+  }
+
+  /**
+   * 离开 / 回来。四挡下都投**自己的事件名**（`presence.away` / `presence.back`）——不再混进
+   * 窗口变化的批里。从前那条路会把单独一条离开错标成 `presence.switched`，2026-10-13 顺手修掉。
+   *
+   * 叫不叫醒按挡位：ambient 那一挡的脾气是不叫醒（跟它攒批一致），其余三挡当场叫醒。
+   * 压缩挡下这段离开还进摘要——时间线才完整（她 2026-10-13 定的）。
+   */
+  private onAway(kind: 'away' | 'back', now: number): void {
+    const text =
+      kind === 'away'
+        ? `[${clock(now)}] 离开键盘`
+        : `[${clock(now)}] 回到键盘，离开了 ${fmtDuration(now - this.awaySinceMs)}`;
+    // 「回来」那一刻把这段离开封进账本；「离开」那一刻不用记，起点就是现在。
+    if (this.delivery === 'digest' && kind === 'back') this.closeAwaySegment(this.awaySinceMs, now);
+    const trigger: TriggerMode = this.delivery === 'ambient' ? 'piggyback' : 'flush';
+    void this.emit(kind === 'away' ? 'presence.away' : 'presence.back', text, trigger);
+  }
+
+  /**
+   * 前台窗口变化。call / ambient 走原来的投递；digest 只进账本（段落已在 onTick 里封口）；
+   * off 只报「本次运行第一次见到的程序」一行（不叫醒），别的只进账本。
+   */
+  private onSwitch(cur: SensorWindow, prev: SensorWindow, dwellMs: number, now: number, log: Logger): void {
+    if (this.delivery === 'digest') return;
+    const line = renderSwitch(cur, prev, dwellMs, now);
+    if (this.delivery === 'off') {
+      const key = exeKey(cur);
+      const fresh = key !== '' && !this.seenExe.has(key);
+      this.seenExe.add(key);
+      if (fresh) {
+        void this.emit('presence.switched', `${line}（本次运行第一次见到这个程序）`, 'piggyback');
+      }
+      return;
+    }
+    this.deliver(line, log);
+  }
+
+  // ——— 账本（digest / off 两挡共用） ———
+
+  /** 把刚结束的一段前台窗口封进账本。 */
+  private closeSegment(win: SensorWindow, startMs: number, endMs: number): void {
+    this.pushLedger({
+      kind: 'window',
+      exe: win.exe,
+      title: win.title,
+      hwnd: win.hwnd,
+      startMs,
+      endMs,
+    });
+  }
+
+  /** 把一段「离开键盘」封进账本。 */
+  private closeAwaySegment(startMs: number, endMs: number): void {
+    this.pushLedger({ kind: 'away', exe: '', title: '', hwnd: 0, startMs, endMs });
+  }
+
+  private pushLedger(seg: DigestSegment): void {
+    if (this.ledgerStartMs === 0) return;
+    const startMs = Math.max(seg.startMs, this.ledgerStartMs);
+    if (seg.endMs <= startMs) return;
+    this.ledger.push({ ...seg, startMs });
+    if (this.ledger.length > LEDGER_MAX_SEGMENTS) this.ledger.splice(0, this.ledger.length - LEDGER_MAX_SEGMENTS);
+  }
+
+  /** 结账：把还开着的那段窗口封到 now，交出全部段落，并重开一本（起点 = now）。 */
+  private takeLedger(now: number): { segments: DigestSegment[]; from: number } {
+    const from = this.ledgerStartMs || now;
+    if (this.current) this.closeSegment(this.current, this.currentSinceMs, now);
+    const segments = this.ledger;
+    this.ledger = [];
+    this.ledgerStartMs = now;
+    return { segments, from };
+  }
+
+  /** 投出一份压缩摘要，然后重开一个周期。账本是空的（没采到东西）就不投，别制造噪音。 */
+  private async flushDigest(trigger: TriggerMode): Promise<void> {
+    if (this.delivery !== 'digest' || this.ledgerStartMs === 0) return;
+    const now = Date.now();
+    const { segments, from } = this.takeLedger(now);
+    this.armDigestTimer();
+    if (segments.length === 0) return;
+    await this.emit('presence.digest', renderDigest(segments, { from, to: now }), trigger);
+  }
+
+  private armDigestTimer(): void {
+    this.clearDigestTimer();
+    const ms = Math.max(1000, Math.round(this.digestMinutes * 60_000));
+    this.digestTimer = setTimeout(() => {
+      this.digestTimer = null;
+      void this.flushDigest('piggyback'); // 周期到了不叫醒，随她下次开口一起进上下文
+    }, ms);
+  }
+
+  private clearDigestTimer(): void {
+    if (this.digestTimer) {
+      clearTimeout(this.digestTimer);
+      this.digestTimer = null;
     }
   }
 
@@ -348,7 +487,7 @@ export class PresenceWorld implements World {
     const lines: string[] = [
       `前台：「${this.current?.title || '（无前台窗口）'}」${this.current?.exe ? `(${this.current.exe})` : ''}`,
       `键鼠空闲：${idleText}（按最近一次轮询）`,
-      `投递姿势：${this.delivery === 'call' ? 'call（即投，叫醒我）' : 'ambient（攒批，不叫醒我）'}`,
+      `投递姿势：${deliveryLabel(this.delivery)}（${DELIVERY_HINT[this.delivery]}）`,
       // 坐标空间先交代清楚，她才好自己框区域。
       `坐标都是物理像素、虚拟屏坐标（原点在上面的 x=${screen.x} y=${screen.y}）；` +
         `虚拟屏 ${screen.width}x${screen.height}，` +
@@ -367,19 +506,38 @@ export class PresenceWorld implements World {
     ];
     if (windows.length > WINDOW_RECEIPT_CAP) lines.push(`（还有 ${windows.length - WINDOW_RECEIPT_CAP} 个没列）`);
 
-    // 她开口看了，攒的当场给：call 攒的合并行 + ambient 批。
+    // 她开口看了，攒的当场给——四个挡位各取各的本子。
     this.clearSwitchTimer();
-    const pending = [...this.ambientLines, ...this.pendingSwitchLines];
-    this.ambientLines = [];
-    this.ambientChars = 0;
-    this.ambientOldestAt = 0;
-    this.pendingSwitchLines = [];
+    this.clearDigestTimer();
     const sinceMs = this.lastPeekAt === 0 ? 0 : now - this.lastPeekAt;
     this.lastPeekAt = now;
-    if (pending.length > 0) {
-      lines.push(`[变化] 距你上次看${sinceMs > 0 ? `约 ${fmtDuration(sinceMs)}` : '（这是第一次看）'}：`, ...pending);
+    const sinceLabel = sinceMs > 0 ? `距你上次看约 ${fmtDuration(sinceMs)}` : '这是第一次看';
+    if (this.delivery === 'digest') {
+      // 压缩挡：调一次 presence_windows 就是「结账」——当前周期到此为止，时间线当场给她，
+      // 然后重开一个周期（她 2026-10-13 问的「能不能停止计时立即投」，入口就是这里）。
+      const { segments, from } = this.takeLedger(now);
+      lines.push(`[压缩结账] ${sinceLabel}，这一周期到此为止：`);
+      for (const line of renderDigest(segments, { from, to: now }).split('\n')) lines.push(line);
+      this.armDigestTimer();
+    } else if (this.delivery === 'off') {
+      // 关闭挡：不主动投，但照记——她问了就给。
+      const { segments } = this.takeLedger(now);
+      if (segments.length > 0) {
+        lines.push(`[关闭期间的变化] ${sinceLabel}（关闭挡只留档、不主动投）：`, ...renderSegmentLines(segments));
+      } else {
+        lines.push(`[变化] ${sinceLabel}：没有。`);
+      }
     } else {
-      lines.push(`[变化] 距你上次看${sinceMs > 0 ? `约 ${fmtDuration(sinceMs)}` : ''}：没有。`);
+      const pending = [...this.ambientLines, ...this.pendingSwitchLines];
+      this.ambientLines = [];
+      this.ambientChars = 0;
+      this.ambientOldestAt = 0;
+      this.pendingSwitchLines = [];
+      if (pending.length > 0) {
+        lines.push(`[变化] ${sinceLabel}：`, ...pending);
+      } else {
+        lines.push(`[变化] ${sinceLabel}：没有。`);
+      }
     }
     return lines.join('\n');
   }
@@ -545,7 +703,14 @@ export class PresenceWorld implements World {
       description:
         'Choose how screen activity reaches you. "ambient": changes accumulate into merged batches that queue ' +
         'without waking you (default). "call": every change is delivered immediately and wakes you, with changes ' +
-        'within 3 seconds merged. Runtime-only: restarting this World goes back to "ambient".',
+        'within 3 seconds merged. "digest": window changes only go into a ledger and are folded into ONE timeline ' +
+        'summary per period (default 20 minutes; pass minutes to change it) — repeats collapse into "back and forth ' +
+        'between X and Y", so you learn where he spent time, not every single switch; leaving/returning still comes ' +
+        'through immediately and also lands in that summary. "off": window activity is kept only for when you ask ' +
+        '(presence_windows), and only two things are ever delivered on their own — leaving/returning (wakes you) and ' +
+        'switching to a program not seen yet this run (does not wake you). "off" is a delivery mute, NOT shutting the ' +
+        'World down: the sensor keeps running and both tools still work. Runtime-only: restarting this World goes ' +
+        'back to "ambient".',
       tags: ['act'],
       parameters: {
         type: 'object',
@@ -553,8 +718,14 @@ export class PresenceWorld implements World {
         properties: {
           mode: {
             type: 'string',
-            enum: ['call', 'ambient'],
-            description: 'call = 即投（叫醒我）；ambient = 攒批（不叫醒我）。',
+            enum: ['call', 'ambient', 'digest', 'off'],
+            description:
+              'call = 即投（叫醒我）；ambient = 攒批（不叫醒我）；digest = 压缩（每周期一份时间线摘要，不叫醒）；' +
+              'off = 关闭（窗口活动只留档，只有离开/回来与「本次运行第一次见到的程序」会自己冒出来）。',
+          },
+          minutes: {
+            type: 'number',
+            description: '压缩挡的周期长度（分钟，默认 20）。只在 mode 是 digest 时有意义；可以给小数。',
           },
         },
         required: ['mode'],
@@ -565,27 +736,79 @@ export class PresenceWorld implements World {
 
   private async setMode(args: Record<string, unknown>): Promise<ToolOutcome> {
     const mode = args.mode;
-    if (mode !== 'call' && mode !== 'ambient') {
-      return fail(`mode 只能是 call 或 ambient，收到的是 ${JSON.stringify(mode ?? null)}。`);
+    if (mode !== 'call' && mode !== 'ambient' && mode !== 'digest' && mode !== 'off') {
+      return fail(`mode 只能是 call、ambient、digest 或 off，收到的是 ${JSON.stringify(mode ?? null)}。`);
+    }
+    let minutes = this.digestMinutes;
+    if (args.minutes !== undefined) {
+      if (typeof args.minutes !== 'number' || !Number.isFinite(args.minutes) || args.minutes <= 0) {
+        return fail(`minutes 要是正数（分钟），收到的是 ${JSON.stringify(args.minutes)}。`);
+      }
+      minutes = args.minutes;
     }
     if (mode === this.delivery) {
-      return { text: mode === 'call' ? '本来就在 call（即投）姿势，没动。' : '本来就在 ambient（攒批）姿势，没动。' };
+      if (mode !== 'digest') {
+        return { text: `本来就在 ${deliveryLabel(mode)} 姿势，没动。` };
+      }
+      if (minutes === this.digestMinutes) {
+        return { text: `本来就在压缩姿势（每 ${fmtMinutes(minutes)}一份摘要），没动。` };
+      }
+      // 周期改了：先把已攒的按旧周期结账投出（不丢账），再按新周期走。
+      this.digestMinutes = minutes;
+      await this.flushDigest('piggyback');
+      this.armDigestTimer();
+      return { text: `压缩周期改成每 ${fmtMinutes(minutes)}。刚才攒的那点已按旧周期结账投出（不叫醒），新一轮从现在算。` };
     }
+
+    const prev = this.delivery;
     this.clearSwitchTimer();
-    this.delivery = mode;
-    if (mode === 'call') {
-      // 攒的全投出去再切，顺序才不会倒。
+    this.clearDigestTimer();
+    const now = Date.now();
+
+    // 旧账按旧姿势结掉，不丢账；切到 digest / off 前先把 call / ambient 攒的批也投掉。
+    if (prev === 'digest') {
+      await this.flushDigest('piggyback');
+    } else if (prev === 'off') {
+      // 关闭挡的留档不外投——但它本来也没打算投，丢掉。
+      this.ledger = [];
+      this.ledgerStartMs = 0;
+    } else {
       this.ambientLines.push(...this.pendingSwitchLines);
       this.pendingSwitchLines = [];
+    }
+    if (mode === 'digest' || mode === 'off') await this.flushAmbient('piggyback');
+
+    this.delivery = mode;
+    this.digestMinutes = minutes;
+
+    if (mode === 'digest') {
+      this.ledger = [];
+      this.ledgerStartMs = now;
+      this.armDigestTimer();
+      return {
+        text:
+          `已切到 digest（压缩）：窗口变化只记账、不单独投；每 ${fmtMinutes(minutes)}折成一份时间线摘要给你（不叫醒）。` +
+          '离开/回来照旧当场叫醒你，也会记进那份摘要。想现在就要一份，调 presence_windows 就是「结账」。',
+      };
+    }
+    if (mode === 'off') {
+      this.ledger = [];
+      this.ledgerStartMs = now;
+      return {
+        text:
+          '已切到 off（关闭）：窗口活动只留档、不主动投。只有两样会自己冒出来——「你离开/回来」（叫醒你），' +
+          '和「切到一个本次运行第一次见到的程序」（不叫醒）。想看留档就调 presence_windows。' +
+          '注意这是投递静音，不是关掉这个 World：传感器照看、截图照用。',
+      };
+    }
+    if (mode === 'call') {
       const n = await this.flushAmbient('flush');
       return {
         text:
           '已切到 call：窗口变化当场投、会叫醒你，3 秒内的连续变化并成一条。' +
-          (n > 0 ? `ambient 攒下的 ${n} 条已一并立即投出。` : ''),
+          (n > 0 ? `攒下的 ${n} 条已一并立即投出。` : ''),
       };
     }
-    this.ambientLines.push(...this.pendingSwitchLines);
-    this.pendingSwitchLines = [];
     return {
       text:
         '已切到 ambient：变化照样记，但攒成批合并投出、不叫醒你——等你下次开口时一起到。' +
@@ -670,17 +893,34 @@ function sameWindow(a: SensorWindow | null, b: SensorWindow | null): boolean {
   return a.hwnd === b.hwnd && a.title === b.title;
 }
 
-function fmtDuration(ms: number): string {
-  if (ms < 1000) return '不到 1 秒';
-  const seconds = Math.round(ms / 1000);
-  if (seconds < 60) return `${seconds} 秒`;
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  return rest === 0 ? `${minutes} 分钟` : `${minutes} 分 ${rest} 秒`;
+/** 关闭挡的去重键：按程序名（大小写不敏感）。查不到进程名就给空串——空串不算「新」。 */
+function exeKey(win: SensorWindow): string {
+  return win.exe.trim().toLowerCase();
 }
 
-function clock(now: number): string {
-  return new Date(now).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+function deliveryLabel(mode: Delivery): string {
+  switch (mode) {
+    case 'call':
+      return 'call（即投）';
+    case 'ambient':
+      return 'ambient（攒批）';
+    case 'digest':
+      return 'digest（压缩）';
+    case 'off':
+      return 'off（关闭）';
+  }
+}
+
+const DELIVERY_HINT: Record<Delivery, string> = {
+  call: '每次变化当场投、叫醒我',
+  ambient: '攒成批、不叫醒我',
+  digest: '只记账，按周期折成一份时间线摘要',
+  off: '只留档，只有离开/回来与第一次见到的程序会自己冒出来',
+};
+
+function fmtMinutes(minutes: number): string {
+  if (minutes >= 1) return `${minutes} 分钟`;
+  return `${Math.round(minutes * 60)} 秒`;
 }
 
 function ellipsis(text: string, max = 24): string {
