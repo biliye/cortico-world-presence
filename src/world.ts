@@ -478,10 +478,7 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_windows',
       description:
-        'See what is on the screen right now: the foreground window, keyboard/mouse idle time, the screen geometry ' +
-        '(virtual screen and each monitor, in physical pixels), and every visible window with its rectangle. ' +
-        'Those rectangles are what you pass to presence_screenshot to capture one spot. ' +
-        'Also delivers anything that accumulated since you last looked.',
+        'List up to 40 visible windows with rectangles, monitor geometry, and foreground/idle state from the latest poll. Returns and clears pending activity; in digest mode, settles the timeline and restarts its period.',
       tags: ['read'],
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       handler: async (_args: Record<string, unknown>, _ctx: ToolCallContext) => this.renderWindows(),
@@ -565,48 +562,34 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_screenshot',
       description:
-        'Take a screenshot and attach it as an image. Three ways to aim it, in this order of precedence: ' +
-        '(1) give x/y/width/height to capture exactly that region — use the rectangles from presence_windows; ' +
-        '(2) give a hwnd to capture that whole window; (3) give target "foreground" (default) or "full". ' +
-        'Regions under the size cap come back at native pixels, so a SMALL region is how you read small text: ' +
-        'framing tighter beats framing wider. The mouse pointer is drawn onto the picture (a screen grab does ' +
-        'not contain the cursor) and its desktop position is in the receipt; pass cursor:false to leave the ' +
-        'arrow off while keeping that position — what you want when watching one small area for changes or ' +
-        'reading small text there. ' +
-        'Only call this when you actually want to look; the picture rides ' +
-        'along with every later request until it falls out of your context, so for "what is he doing" over time ' +
-        'presence_windows is far cheaper.',
+        'Attach a PNG/JPEG screenshot. Priority: region (width + height, optional x/y) > hwnd > target. Use window rectangles to frame a small area; long edges over 1600px are downscaled. Receipt reports captured bounds, coordinate mapping and cursor status.',
       tags: ['read'],
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          x: { type: 'integer', description: '区域的左上角 x（物理像素，虚拟屏坐标）。不给算 0。' },
-          y: { type: 'integer', description: '区域的左上角 y（物理像素，虚拟屏坐标）。不给算 0。' },
-          width: { type: 'integer', description: '区域宽（物理像素，至少 16）。给了 width 与 height 就按区域截。' },
-          height: { type: 'integer', description: '区域高（物理像素，至少 16）。' },
+          x: { type: 'integer', description: '区域左上 x，虚拟桌面物理像素，默认 0。' },
+          y: { type: 'integer', description: '区域左上 y，同一坐标系，默认 0，可为负数。' },
+          width: { type: 'integer', description: '区域宽，物理像素，至少 16；须同时给 height。' },
+          height: { type: 'integer', description: '区域高，物理像素，至少 16；须同时给 width。' },
           hwnd: {
             type: 'integer',
-            description: 'presence_windows 列出的窗口句柄；给了就截这个窗口整个（区域参数优先）。',
+            description: '已知的正整数窗口句柄，截整个窗口；区域优先。',
           },
           target: {
             type: 'string',
             enum: ['foreground', 'full'],
-            description: 'foreground = 只截当前前台窗口（默认）；full = 全部显示器拼一张。',
+            description: 'foreground：前台窗口（默认）；full：全部显示器。',
           },
           grid: {
             type: 'boolean',
             description:
-              '叠一层淡格线：每条线落在桌面坐标的整百处、线旁标着那个坐标——要按图上的位置去点' +
-              '什么东西（量坐标）时加它，照着线旁的数字读就行。只是"看看他在干嘛"就不用加。',
+              '叠加标有桌面坐标的格线，默认 false；量坐标时使用。',
           },
           cursor: {
             type: 'boolean',
             description:
-              '要不要在图上画鼠标箭头（默认画；抓屏抓不到光标，所以是我们画上去的，形状是系统真光标）。' +
-              '**盯同一块看变化**、或者**要读那一块的小字**时传 false：光标停在框里的话，一个会动的箭头' +
-              '会让「和上次像素级完全相同」永远说不出口，也会盖住字。光标在哪那句坐标**照给不误**，' +
-              '关掉的只是图上那个箭头。',
+              '默认 true，叠加系统光标；false 可减少遮字或比图干扰，仍报告可读到的光标坐标。',
           },
         },
       },
@@ -720,16 +703,7 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_set_mode',
       description:
-        'Choose how screen activity reaches you. "digest" (default): window changes only go into a ledger and are ' +
-        'folded into ONE timeline summary per period (default 20 minutes; pass minutes to change it) — repeats ' +
-        'collapse into "back and forth between X and Y", so you learn where he spent time, not every single switch; ' +
-        'leaving/returning still comes through immediately and also lands in that summary. "ambient": changes ' +
-        'accumulate into merged batches that queue without waking you. "call": every change is delivered immediately ' +
-        'and wakes you, with changes within 3 seconds merged. "off": window activity is kept only for when you ask ' +
-        '(presence_windows), and only two things are ever delivered on their own — leaving/returning (wakes you) and ' +
-        'switching to a program not seen yet this run (does not wake you). "off" is a delivery mute, NOT shutting the ' +
-        'World down: the sensor keeps running and both tools still work. Runtime-only: restarting this World goes ' +
-        'back to "digest".',
+        'Set delivery mode (see Presence environment rules). Runtime-only; restart resets to digest with a 20-minute period. Away never wakes you; back wakes you except in ambient. off keeps the sensor and tools available.',
       tags: ['act'],
       parameters: {
         type: 'object',
@@ -739,12 +713,11 @@ export class PresenceWorld implements World {
             type: 'string',
             enum: ['call', 'ambient', 'digest', 'off'],
             description:
-              'call = 即投（叫醒我）；ambient = 攒批（不叫醒我）；digest = 压缩（每周期一份时间线摘要，不叫醒）；' +
-              'off = 关闭（窗口活动只留档，只有离开/回来与「本次运行第一次见到的程序」会自己冒出来）。',
+              'digest：周期摘要；ambient：攒批；call：窗口变化叫醒；off：窗口留档，仅首次见到的程序另报一行。',
           },
           minutes: {
             type: 'number',
-            description: '压缩挡的周期长度（分钟，默认 20）。只在 mode 是 digest 时有意义；可以给小数。',
+            description: 'digest 周期分钟数，正数，可为小数；省略沿用当前值（初始 20）。',
           },
         },
         required: ['mode'],
@@ -804,13 +777,13 @@ export class PresenceWorld implements World {
       return {
         text:
           `已切到 digest（压缩）：窗口变化只记账、不单独投；每 ${fmtMinutes(minutes)}折成一份时间线摘要给你（不叫醒）。` +
-          '离开/回来照旧当场叫醒你，也会记进那份摘要。想现在就要一份，调 presence_windows 就是「结账」。',
+          '他离开时只投不叫醒，回来时叫醒；离开时段也记进摘要。调 presence_windows 可立即结账。',
       };
     }
     if (mode === 'off') {
       return {
         text:
-          '已切到 off（关闭）：窗口活动只留档、不主动投。只有两样会自己冒出来——「你离开/回来」（叫醒你），' +
+          '已切到 off（关闭）：窗口活动只留档、不主动投。另报他离开（不叫醒）、回来（叫醒），' +
           '和「切到一个本次运行第一次见到的程序」（不叫醒）。想看留档就调 presence_windows。' +
           '注意这是投递静音，不是关掉这个 World：传感器照看、截图照用。',
       };
