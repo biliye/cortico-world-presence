@@ -4,6 +4,11 @@
   "type": "module",
   "description": "Cortico World: 在场感（Windows 专用）——前台窗口变化、离开/回来键鼠、按需的窗口清单与截图",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/biliye/cortico-world-presence.git"
+  },
+  "homepage": "https://github.com/biliye/cortico-world-presence#readme",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public"

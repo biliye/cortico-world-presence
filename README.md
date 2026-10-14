@@ -3,6 +3,20 @@
 Cortico 的「在场感」World:让 bot 知道开发者在不在电脑前、在干什么,想看的时候能截一张屏。
 Windows 专用(传感器与截图都走 Win32,经由系统自带的 PowerShell,零安装)。
 
+## 怎么装
+
+Windows 专用,**零安装** —— 传感器与截图都走系统自带的 PowerShell,不用装任何别的东西。
+
+1. 装进部署:控制台「扩展 → 扩展市场」里找到它点安装(它在部署的 `extensions/` 里跑一次
+   `pnpm add`);或手动 `cd extensions && corepack pnpm add --ignore-workspace cortico-world-presence`。
+   ★ 若本机默认源是镜像(npmmirror),装的时候显式指官方源 `--registry=https://registry.npmjs.org/`。
+2. 在部署的 `config.json` 里写 `worlds.presence`(至少 `enabled: true`,其余见下面的配置表),
+   **重启实例**。
+3. 重启后挂的是 `digest` 挡 —— 窗口变化只记账,每 20 分钟折成一条 `presence.digest`。想看效果先让她
+   `presence_set_mode {mode:"digest", minutes:1}` 压到 1 分钟,再在几个窗口之间来回切。
+
+`enabled` 默认 `false`:装上去不会自己开始采样。
+
 ## 它给什么
 
 - **事件**(被动):
