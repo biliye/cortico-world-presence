@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ToolCallContext, ToolDef, ToolOutcome } from 'cortico/core/types.ts';
 import { dryMountWorld } from 'cortico/extensions/dry-mount.ts';
 import type { ScreenshotResult, ScreenshotTarget, ScreenInfo, WindowInfo } from '../src/capture.ts';
@@ -712,5 +712,190 @@ describe('Presence World', () => {
       expect(host.events.map((e) => e.type)).toEqual(['presence.digest']);
       expect(host.pushOpts[0]?.trigger).toBe('piggyback');
     });
+  });
+});
+
+describe('紧凑摘要与按需时间线', () => {
+  const epoch = new Date('2026-10-14T12:00:00Z').getTime();
+  const active: PresenceWorld[] = [];
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(epoch);
+  });
+  afterEach(async () => {
+    for (const world of active.splice(0)) await world.stop();
+    vi.useRealTimers();
+  });
+  async function setup(cfg: Partial<PresenceConfigSection> = {}) {
+    const result = build({}, cfg);
+    active.push(result.world);
+    await result.world.start(result.host);
+    return result;
+  }
+  const at = (seconds: number) => vi.setSystemTime(epoch + seconds * 1000);
+  const idOf = (text: string) => JSON.parse(text.split('时间线：presence_windows ')[1]!).snapshot as string;
+
+  it('同窗口无切换跨两次结账：各算本周期，不重复累计前一周期', async () => {
+    const { sensor, tools } = await setup();
+    sensor.tick(100, WIN_A);
+    at(60);
+    const first = await call(tools.presence_windows);
+    expect(first.text).toContain('chrome 1 分钟');
+    expect(first.text).toContain('观测切换 0 次');
+    at(180);
+    const second = await call(tools.presence_windows);
+    expect(second.text).toContain('chrome 2 分钟');
+    expect(second.text).not.toContain('chrome 3 分钟');
+    const history = await call(tools.presence_windows, { view: 'timeline', snapshot: idOf(first.text) });
+    expect(history.text).toContain('共 1 分钟');
+  });
+
+  it('无切换仍周期投摘要；查询历史不列窗口、不清账、不延迟下个周期', async () => {
+    const { sensor, tools, host, calls } = await setup();
+    await call(tools.presence_set_mode, { mode: 'digest', minutes: 1 });
+    sensor.tick(100, WIN_A);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(host.events).toHaveLength(1);
+    expect(host.events[0].text).toContain('chrome 1 分钟');
+    const id = idOf(host.events[0].text);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const firstRead = await call(tools.presence_windows, { view: 'timeline', snapshot: id });
+    const secondRead = await call(tools.presence_windows, { view: 'timeline', snapshot: id });
+    expect(firstRead).toEqual(secondRead);
+    expect(calls.listWindows).toBe(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(host.events).toHaveLength(2);
+    expect(host.events[1].text).toContain('chrome 1 分钟');
+    expect(host.pushOpts.every((opts) => opts?.trigger === 'piggyback')).toBe(true);
+  });
+
+  it('非循环序列聚合；零时长切换及同句柄改标题仍计次数，重复采样不计', async () => {
+    const { sensor, tools } = await setup();
+    sensor.tick(100, WIN_A);
+    at(60);
+    sensor.tick(100, WIN_B);
+    sensor.tick(100, WIN_A); // 同一毫秒内切换，不能用有效段数减一推导次数
+    sensor.tick(100, WIN_A);
+    at(120);
+    sensor.tick(100, { ...WIN_A, title: '新标题' });
+    at(180);
+    const out = await call(tools.presence_windows);
+    expect(out.text).toContain('观测切换 3 次');
+    expect(out.text).toContain('应用累计：chrome 3 分钟');
+    expect(out.text).toContain('「新标题」(chrome) 1 分钟');
+  });
+
+  it('持续离开跨周期，回来后只计新周期部分，前台时长不叠加离开', async () => {
+    const { sensor, tools } = await setup({ awayAfterMs: 100 });
+    sensor.tick(50, WIN_A);
+    at(10);
+    sensor.tick(200, WIN_A);
+    at(70);
+    const first = await call(tools.presence_windows);
+    expect(first.text).toContain('离开键盘累计 1 分钟');
+    expect(first.text).toContain('chrome 1 分 10 秒');
+    at(130);
+    const second = await call(tools.presence_windows);
+    expect(second.text).toContain('离开键盘累计 1 分钟');
+    at(160);
+    sensor.tick(50, WIN_A);
+    at(190);
+    const third = await call(tools.presence_windows);
+    expect(third.text).toContain('离开键盘累计 30 秒');
+    expect(third.text).toContain('chrome 1 分钟');
+    expect(third.text).toContain('未达离开阈值');
+  });
+
+  it('未采样与前台未知不会冒充无变化或继续累计旧窗口', async () => {
+    const { sensor, tools } = await setup();
+    const empty = await call(tools.presence_windows);
+    expect(empty.text).toContain('没有可累计的前台窗口采样');
+    expect((await call(tools.presence_windows, { view: 'timeline' })).failed).toBe(true);
+    sensor.tick(100, WIN_A);
+    at(60);
+    sensor.tick(100, null);
+    at(180);
+    const out = await call(tools.presence_windows);
+    expect(out.text).toContain('chrome 1 分钟');
+    expect(out.text).toContain('最近采样：前台未知');
+  });
+
+  it('指定记录分页不混入后续周期，原始顺序与完整标题保留', async () => {
+    const { sensor, tools } = await setup();
+    const longTitle = '长标题'.repeat(40);
+    sensor.tick(100, { ...WIN_A, title: longTitle });
+    at(60); sensor.tick(100, WIN_B);
+    at(120); sensor.tick(100, WIN_C);
+    at(180);
+    const out = await call(tools.presence_windows);
+    const id = idOf(out.text);
+    const page1 = await call(tools.presence_windows, { view: 'timeline', snapshot: id, limit: 2 });
+    expect(page1.text).toContain(longTitle);
+    expect(page1.text).toContain('"offset":2');
+    at(240); await call(tools.presence_windows);
+    const page2 = await call(tools.presence_windows, { view: 'timeline', snapshot: id, offset: 2, limit: 2 });
+    expect(page2.text).toContain('「终端」(wezterm) 共 1 分钟');
+    expect(page2.text).toContain('记录已读完');
+    expect(page2.text).not.toContain('main.ts');
+  });
+
+  it('仅保留最近 8 份，过期编号明确失败，默认读取最新记录', async () => {
+    const { sensor, tools } = await setup();
+    sensor.tick(100, WIN_A);
+    const ids: string[] = [];
+    for (let i = 1; i <= 9; i++) {
+      at(i * 60);
+      ids.push(idOf((await call(tools.presence_windows)).text));
+    }
+    expect((await call(tools.presence_windows, { view: 'timeline', snapshot: ids[0] })).failed).toBe(true);
+    expect((await call(tools.presence_windows, { view: 'timeline', snapshot: ids[1] })).failed).not.toBe(true);
+    expect((await call(tools.presence_windows, { view: 'timeline' })).text).toContain(ids[8]);
+  });
+
+  it('超过 400 段如实报告截断，切换计数不随旧段淘汰', async () => {
+    const { sensor, tools } = await setup();
+    sensor.tick(100, WIN_A);
+    for (let i = 1; i <= 450; i++) {
+      at(i);
+      sensor.tick(100, i % 2 ? WIN_B : WIN_A);
+    }
+    at(451);
+    const out = await call(tools.presence_windows);
+    expect(out.text).toContain('观测切换 450 次');
+    expect(out.text).toContain('已丢弃 51 段');
+    const raw = await call(tools.presence_windows, { view: 'timeline' });
+    expect(raw.text).toContain('共 400 段');
+    expect(raw.text).toContain('此时间线不完整');
+    expect(raw.text).toContain('"offset":40');
+  });
+
+  it('off 切挡保存时间线但不外投；故障后已有记录仍可读', async () => {
+    const { sensor, tools, host } = await setup();
+    await call(tools.presence_set_mode, { mode: 'off' });
+    sensor.tick(100, WIN_A);
+    at(60);
+    await call(tools.presence_set_mode, { mode: 'ambient' });
+    expect(host.events).toHaveLength(0);
+    sensor.exit({ code: 1 });
+    const raw = await call(tools.presence_windows, { view: 'timeline' });
+    expect(raw.failed).not.toBe(true);
+    expect(raw.text).toContain('共 1 分钟');
+  });
+
+  it('非法历史参数拒绝且不触碰当前账本；停止后不留摘要计时器', async () => {
+    const { world, sensor, tools, calls } = await setup();
+    sensor.tick(100, WIN_A);
+    for (const args of [
+      { view: 'bad' }, { offset: 1 }, { view: 'timeline', snapshot: '' },
+      { view: 'timeline', offset: -1 }, { view: 'timeline', offset: 1.5 },
+      { view: 'timeline', limit: 101 }, { view: 'timeline', limit: 0 },
+      { view: 'timeline', offset: null }, { view: 'timeline', limit: null },
+    ]) expect((await call(tools.presence_windows, args)).failed).toBe(true);
+    expect(calls.listWindows).toBe(0);
+    at(60);
+    expect((await call(tools.presence_windows)).text).toContain('chrome 1 分钟');
+    expect((await call(tools.presence_windows, { view: 'timeline', offset: 2 })).failed).toBe(true);
+    await world.stop();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -4,8 +4,8 @@
  *
  * 投递姿势握在 bot 手里，是运行态、**不写回配置**（hearing 同款约定）。四挡（2026-10-13 加的后两挡、
  * 并把默认从 ambient 换成 digest——开发者当天定的）：
- * - digest（压缩，**默认**）：窗口变化只进账本、**不单独投**，到周期（默认 20 分钟）折成一份时间线
- *   摘要投出——「同一批里重复的折成一条、只留在哪几个窗口之间来回」。回来（back）照旧当场叫醒，
+ * - digest（压缩，**默认**）：窗口变化只进账本、**不单独投**，到周期（默认 20 分钟）投累计摘要，
+ *   原始时间线按记录编号分页读取。零切换仍计停留。回来（back）照旧当场叫醒，
  *   同时也记进摘要那一段；**离开（away）只投、不叫醒**（见下）；
  * - ambient：窗口变化攒成批，随她下次开口一起进上下文，不叫醒她；
  * - call：变化当场投、叫醒她，3 秒内的连续变化并成一条，免得一次 alt-tab 双响；
@@ -35,7 +35,7 @@ import type {
   WorldLamp,
 } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   SCREENSHOT_MAX_EDGE,
@@ -51,7 +51,7 @@ import {
   type WindowList,
 } from './capture.ts';
 import { PRESENCE_CONFIG_GROUP, type PresenceConfigSection } from './config.ts';
-import { clock, fmtDuration, renderDigest, renderSegmentLines, type DigestSegment } from './digest.ts';
+import { clock, fmtDuration, renderCompactDigest, renderSegmentLines, type DigestSegment, type DigestSnapshot } from './digest.ts';
 import { spawnSensor, type PresenceSensor, type SensorTick, type SensorWindow } from './sensor.ts';
 
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
@@ -66,6 +66,8 @@ const CALL_COALESCE_MS = 3000;
 const DIGEST_DEFAULT_MINUTES = 20;
 /** 账本最多留多少段（digest / off 两挡共用），超了丢最老的。 */
 const LEDGER_MAX_SEGMENTS = 400;
+/** 最近八次结账可按需翻阅；每份仍受账本的 400 段上限约束。 */
+const HISTORY_MAX_SNAPSHOTS = 8;
 /** pollIntervalMs 的下限：再密就是拿 token 换分辨率，且 PowerShell 起一轮也有成本。 */
 const MIN_POLL_MS = 2000;
 /** 窗口清单回执最多列多少行，剩下的报个数。 */
@@ -114,6 +116,11 @@ export class PresenceWorld implements World {
   private ledger: DigestSegment[] = [];
   /** 账本的起点（进 digest / off 挡的时刻）。0 = 现在没有账本。 */
   private ledgerStartMs = 0;
+  private ledgerSwitches = 0;
+  private ledgerDropped = 0;
+  private snapshots: DigestSnapshot[] = [];
+  private readonly historyRun = randomUUID().slice(0, 8);
+  private snapshotSequence = 0;
   /** 压缩挡的周期计时器与当前周期长度（分钟）。 */
   private digestTimer: ReturnType<typeof setTimeout> | null = null;
   private digestMinutes = DIGEST_DEFAULT_MINUTES;
@@ -226,6 +233,7 @@ export class PresenceWorld implements World {
     } else if (this.delivery !== 'off') {
       await this.flushAmbient('piggyback');
     }
+    this.clearDigestTimer(); // flushDigest 会重开周期，停止时不能留下计时器。
     // off 挡不投，也不留：账本只是「她问就给」的留档，收摊时不该突然冒一条。
     this.ledger = [];
     this.ledgerStartMs = 0;
@@ -257,13 +265,21 @@ export class PresenceWorld implements World {
     // 前台窗口变化：与上次采样对比。第一回只打底（current 为空时收养，不报事件），
     // 重启后的第一眼不该算「他切了窗口」（browser World 同款）。
     const cur = tick.cur;
-    if (!cur) return;
+    if (!cur) {
+      if (this.current && (this.delivery === 'digest' || this.delivery === 'off')) {
+        this.closeSegment(this.current, this.currentSinceMs, now);
+      }
+      this.current = null;
+      this.currentSinceMs = now;
+      return;
+    }
     const prev = this.current;
     if (prev && sameWindow(cur, prev)) return;
     const dwellMs = prev ? now - this.currentSinceMs : 0;
     // digest / off 两挡走账本：刚结束的这段先封口（起点不早于进挡那一刻）。
     if (prev && (this.delivery === 'digest' || this.delivery === 'off')) {
       this.closeSegment(prev, this.currentSinceMs, now);
+      this.ledgerSwitches += 1;
     }
     this.current = cur;
     this.currentSinceMs = now;
@@ -289,7 +305,7 @@ export class PresenceWorld implements World {
         ? `[${clock(now)}] 离开键盘`
         : `[${clock(now)}] 回到键盘，离开了 ${fmtDuration(now - this.awaySinceMs)}`;
     // 「回来」那一刻把这段离开封进账本；「离开」那一刻不用记，起点就是现在。
-    if (this.delivery === 'digest' && kind === 'back') this.closeAwaySegment(this.awaySinceMs, now);
+    if ((this.delivery === 'digest' || this.delivery === 'off') && kind === 'back') this.closeAwaySegment(this.awaySinceMs, now);
     const trigger: TriggerMode = kind === 'away' || this.delivery === 'ambient' ? 'piggyback' : 'flush';
     void this.emit(kind === 'away' ? 'presence.away' : 'presence.back', text, trigger);
   }
@@ -337,17 +353,37 @@ export class PresenceWorld implements World {
     const startMs = Math.max(seg.startMs, this.ledgerStartMs);
     if (seg.endMs <= startMs) return;
     this.ledger.push({ ...seg, startMs });
-    if (this.ledger.length > LEDGER_MAX_SEGMENTS) this.ledger.splice(0, this.ledger.length - LEDGER_MAX_SEGMENTS);
+    if (this.ledger.length > LEDGER_MAX_SEGMENTS) {
+      this.ledgerDropped += this.ledger.length - LEDGER_MAX_SEGMENTS;
+      this.ledger.splice(0, this.ledger.length - LEDGER_MAX_SEGMENTS);
+    }
   }
 
   /** 结账：把还开着的那段窗口封到 now，交出全部段落，并重开一本（起点 = now）。 */
-  private takeLedger(now: number): { segments: DigestSegment[]; from: number } {
+  private takeLedger(now: number): DigestSnapshot {
     const from = this.ledgerStartMs || now;
     if (this.current) this.closeSegment(this.current, this.currentSinceMs, now);
-    const segments = this.ledger;
+    if (this.away) this.closeAwaySegment(this.awaySinceMs, now);
+    const snapshot: DigestSnapshot = {
+      id: `${this.historyRun}-${++this.snapshotSequence}`,
+      from, to: now,
+      segments: this.ledger.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs),
+      switches: this.ledgerSwitches,
+      dropped: this.ledgerDropped,
+      current: this.current ? { title: this.current.title, exe: this.current.exe } : null,
+      away: this.away,
+      idleMs: this.idleMs,
+    };
     this.ledger = [];
     this.ledgerStartMs = now;
-    return { segments, from };
+    this.ledgerSwitches = 0;
+    this.ledgerDropped = 0;
+    // 空采样不挤掉有用的历史；无切换但有停留的记录仍保存。
+    if (snapshot.segments.length || snapshot.switches) {
+      this.snapshots.push(snapshot);
+      if (this.snapshots.length > HISTORY_MAX_SNAPSHOTS) this.snapshots.shift();
+    }
+    return snapshot;
   }
 
   /**
@@ -357,6 +393,8 @@ export class PresenceWorld implements World {
   private armDelivery(mode: Delivery, now: number): void {
     this.delivery = mode;
     this.ledger = [];
+    this.ledgerSwitches = 0;
+    this.ledgerDropped = 0;
     this.ledgerStartMs = mode === 'digest' || mode === 'off' ? now : 0;
     this.clearDigestTimer();
     if (mode === 'digest') this.armDigestTimer();
@@ -366,10 +404,10 @@ export class PresenceWorld implements World {
   private async flushDigest(trigger: TriggerMode): Promise<void> {
     if (this.delivery !== 'digest' || this.ledgerStartMs === 0) return;
     const now = Date.now();
-    const { segments, from } = this.takeLedger(now);
+    const snapshot = this.takeLedger(now);
     this.armDigestTimer();
-    if (segments.length === 0) return;
-    await this.emit('presence.digest', renderDigest(segments, { from, to: now }), trigger);
+    if (snapshot.segments.length === 0 && snapshot.switches === 0) return;
+    await this.emit('presence.digest', renderCompactDigest(snapshot), trigger);
   }
 
   private armDigestTimer(): void {
@@ -478,11 +516,46 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_windows',
       description:
-        'List up to 40 visible windows with rectangles, monitor geometry, and foreground/idle state from the latest poll. Returns and clears pending activity; in digest mode, settles the timeline and restarts its period.',
+        'List up to 40 windows with geometry and latest polled foreground/idle state. In digest/off, settle a compact summary (digest restarts its period); other modes drain pending activity. view=timeline reads saved raw segments without listing windows, clearing activity or resetting timers. Keeps the last 8 settlements in memory; restart loses them.',
       tags: ['read'],
-      parameters: { type: 'object', additionalProperties: false, properties: {} },
-      handler: async (_args: Record<string, unknown>, _ctx: ToolCallContext) => this.renderWindows(),
+      parameters: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          view: { type: 'string', enum: ['summary', 'timeline'], description: '默认 summary；timeline 读取已结账的逐段记录。' },
+          snapshot: { type: 'string', description: '仅 timeline：摘要中的记录编号，省略取最近一次。' },
+          offset: { type: 'integer', minimum: 0, description: '仅 timeline：从第几段开始（从 0 起），默认 0。' },
+          limit: { type: 'integer', minimum: 1, maximum: 100, description: '仅 timeline：每页段数，默认 40。' },
+        },
+      },
+      handler: async (args: Record<string, unknown>, _ctx: ToolCallContext) => this.readWindows(args),
     };
+  }
+
+  private readWindows(args: Record<string, unknown>): Promise<ToolOutcome | string> | ToolOutcome | string {
+    if (args.view !== undefined && args.view !== 'summary' && args.view !== 'timeline') return fail('view 只能是 summary 或 timeline。');
+    if (args.view !== 'timeline') {
+      if (args.snapshot !== undefined || args.offset !== undefined || args.limit !== undefined) return fail('snapshot/offset/limit 仅用于 view:"timeline"。');
+      return this.renderWindows();
+    }
+    if (args.snapshot !== undefined && (typeof args.snapshot !== 'string' || !args.snapshot.trim())) return fail('snapshot 要是摘要中的记录编号。');
+    const offset = args.offset === undefined ? 0 : args.offset;
+    const limit = args.limit === undefined ? 40 : args.limit;
+    if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0 ||
+        typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 100) return fail('offset 要是非负整数，limit 要是 1–100 的整数。');
+    const snapshot = args.snapshot === undefined ? this.snapshots.at(-1) : this.snapshots.find((s) => s.id === args.snapshot);
+    if (!snapshot) return fail('没有这份结账记录：仅保留最近 8 份，重启即清空。可在 digest/off 挡调用 presence_windows 结账获取新记录。');
+    if (offset > snapshot.segments.length) return fail(`offset 超出范围；这份记录有 ${snapshot.segments.length} 段。`);
+    const page = snapshot.segments.slice(offset, offset + limit);
+    const next = offset + page.length;
+    return [
+      `[时间线 ${snapshot.id} ${new Date(snapshot.from).toISOString()}–${new Date(snapshot.to).toISOString()}；第 ${offset}–${next} 段（左闭右开），共 ${snapshot.segments.length} 段]`,
+      '按轮询记录；前台停留含空闲，离开段可能与窗口段重叠。',
+      ...(snapshot.dropped ? [`已丢弃 ${snapshot.dropped} 段旧记录，此时间线不完整。`] : []),
+      ...renderSegmentLines(page),
+      next < snapshot.segments.length
+        ? `下一页：presence_windows ${JSON.stringify({ view: 'timeline', snapshot: snapshot.id, offset: next, limit })}`
+        : '（记录已读完；查询未清账。）',
+    ].join('\n');
   }
 
   private async renderWindows(): Promise<ToolOutcome | string> {
@@ -529,20 +602,16 @@ export class PresenceWorld implements World {
     this.lastPeekAt = now;
     const sinceLabel = sinceMs > 0 ? `距你上次看约 ${fmtDuration(sinceMs)}` : '这是第一次看';
     if (this.delivery === 'digest') {
-      // 压缩挡：调一次 presence_windows 就是「结账」——当前周期到此为止，时间线当场给她，
+      // 压缩挡：默认查询就是「结账」——当前周期到此为止，累计摘要当场给她，
       // 然后重开一个周期（她 2026-10-13 问的「能不能停止计时立即投」，入口就是这里）。
-      const { segments, from } = this.takeLedger(now);
+      const snapshot = this.takeLedger(now);
       lines.push(`[压缩结账] ${sinceLabel}，这一周期到此为止：`);
-      for (const line of renderDigest(segments, { from, to: now }).split('\n')) lines.push(line);
+      lines.push(renderCompactDigest(snapshot));
       this.armDigestTimer();
     } else if (this.delivery === 'off') {
       // 关闭挡：不主动投，但照记——她问了就给。
-      const { segments } = this.takeLedger(now);
-      if (segments.length > 0) {
-        lines.push(`[关闭期间的变化] ${sinceLabel}（关闭挡只留档、不主动投）：`, ...renderSegmentLines(segments));
-      } else {
-        lines.push(`[变化] ${sinceLabel}：没有。`);
-      }
+      const snapshot = this.takeLedger(now);
+      lines.push(`[关闭期间的变化] ${sinceLabel}（关闭挡只留档、不主动投）：`, renderCompactDigest(snapshot));
     } else {
       const pending = [...this.ambientLines, ...this.pendingSwitchLines];
       this.ambientLines = [];
@@ -761,8 +830,8 @@ export class PresenceWorld implements World {
     if (prev === 'digest') {
       await this.flushDigest('piggyback');
     } else if (prev === 'off') {
-      // 关闭挡的留档不外投——但它本来也没打算投，丢掉。
-      this.ledger = [];
+      // 不主动投，但保存成可按需读取的记录，切挡不丢掉这份时间线。
+      this.takeLedger(now);
       this.ledgerStartMs = 0;
     } else {
       this.ambientLines.push(...this.pendingSwitchLines);
@@ -776,7 +845,7 @@ export class PresenceWorld implements World {
     if (mode === 'digest') {
       return {
         text:
-          `已切到 digest（压缩）：窗口变化只记账、不单独投；每 ${fmtMinutes(minutes)}折成一份时间线摘要给你（不叫醒）。` +
+          `已切到 digest（压缩）：窗口变化只记账、不单独投；每 ${fmtMinutes(minutes)}给一份累计摘要（不叫醒），原始时间线可按需查询。` +
           '他离开时只投不叫醒，回来时叫醒；离开时段也记进摘要。调 presence_windows 可立即结账。',
       };
     }
@@ -901,7 +970,7 @@ function deliveryLabel(mode: Delivery): string {
 const DELIVERY_HINT: Record<Delivery, string> = {
   call: '每次变化当场投、叫醒我',
   ambient: '攒成批、不叫醒我',
-  digest: '只记账，按周期折成一份时间线摘要',
+  digest: '按周期给累计摘要，原始时间线可按需查询',
   off: '只留档，只有离开/回来与第一次见到的程序会自己冒出来',
 };
 
