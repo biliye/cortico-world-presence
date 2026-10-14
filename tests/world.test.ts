@@ -7,6 +7,7 @@ import { dryMountWorld } from 'cortico/extensions/dry-mount.ts';
 import type { ScreenshotResult, ScreenshotTarget, ScreenInfo, WindowInfo } from '../src/capture.ts';
 import { PRESENCE_DEFAULTS, type PresenceConfigSection } from '../src/config.ts';
 import { PRESENCE } from '../src/definition.ts';
+import { clock } from '../src/digest.ts';
 import type { PresenceSensor, SensorExit, SensorTick, SensorWindow } from '../src/sensor.ts';
 import { PresenceWorld, type PresenceWorldOptions } from '../src/world.ts';
 import { FakeHost } from './helpers/fake-host.ts';
@@ -237,6 +238,8 @@ describe('Presence World', () => {
     await sleep(20);
     const texts = host.events.map((e) => e.text);
     expect(texts.some((t) => t.includes('离开键盘'))).toBe(true);
+    // 离开正文写明「最后一次键鼠输入在几点」——它比真正离开晚一整个阈值，这一点得自己说清楚。
+    expect(texts.find((t) => t.includes('离开键盘'))).toContain('最后一次键鼠输入在');
     const back = texts.find((t) => t.includes('回到键盘'));
     expect(back).toBeTruthy();
     expect(back).toContain('离开了');
@@ -589,7 +592,8 @@ describe('Presence World', () => {
     });
 
     it('digest：离开只投不叫醒、回来当场叫醒，两条都记进摘要', async () => {
-      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100 });
+      // backWakeAfterMs 0 = 门槛关掉、每次回来都叫醒；门槛本身另有专门用例。
+      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100, backWakeAfterMs: 0 });
       await world.start(host);
       await call(tools.presence_set_mode, { mode: 'digest', minutes: 20 });
       sensor.tick(50, WIN_A);
@@ -644,7 +648,7 @@ describe('Presence World', () => {
     });
 
     it('off：离开只投不叫醒、回来叫醒', async () => {
-      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100 });
+      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100, backWakeAfterMs: 0 });
       await world.start(host);
       await call(tools.presence_set_mode, { mode: 'off' });
       sensor.tick(50, WIN_A);
@@ -659,7 +663,7 @@ describe('Presence World', () => {
     });
 
     it('「离开」不叫醒是四挡通用——连 call 挡也不叫醒（「回来」照旧）', async () => {
-      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100 });
+      const { world, host, sensor, tools } = build({}, { awayAfterMs: 100, backWakeAfterMs: 0 });
       await world.start(host);
       await call(tools.presence_set_mode, { mode: 'call' });
       sensor.tick(50, WIN_A);
@@ -897,5 +901,86 @@ describe('紧凑摘要与按需时间线', () => {
     expect((await call(tools.presence_windows, { view: 'timeline', offset: 2 })).failed).toBe(true);
     await world.stop();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+/**
+ * 2026-10-14：离开/回来那两个数都改成从「最后一次键鼠输入」算起（从前从「发现离开」起算，
+ * 于是 5 分钟的阈值会吐出「离开了 30 秒」），并加了「短离开回来不叫醒」的门槛
+ * `backWakeAfterMs`（默认 10 分钟）。用假时钟，好把分钟级的离开一次摆到面前。
+ */
+describe('离开/回来的时长口径与叫醒门槛', () => {
+  const epoch = new Date('2026-10-14T12:00:00Z').getTime();
+  const active: PresenceWorld[] = [];
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(epoch);
+  });
+  afterEach(async () => {
+    for (const world of active.splice(0)) await world.stop();
+    vi.useRealTimers();
+  });
+  async function setup(cfg: Partial<PresenceConfigSection> = {}) {
+    const result = build({}, cfg);
+    active.push(result.world);
+    await result.world.start(result.host);
+    return result;
+  }
+  const at = (seconds: number) => vi.setSystemTime(epoch + seconds * 1000);
+
+  it('起点回填到最后一次键鼠输入：正文与摘要都按真实离开时长算', async () => {
+    const { sensor, host, tools } = await setup({ awayAfterMs: 300000 });
+    sensor.tick(5000, WIN_A); // t=0：空闲 5 秒，还没到阈值
+    at(600);
+    sensor.tick(300000, WIN_A); // t=600s：连续 5 分钟没输入 → 判离开，真实起点在 t=300s
+    expect(host.events.map((e) => e.type)).toEqual(['presence.away']);
+    expect(host.events[0].text).toContain(`最后一次键鼠输入在 ${clock(epoch + 300_000)}`);
+    at(660);
+    sensor.tick(5000, WIN_A); // 回来：真实离开 300s→660s
+    expect(host.events[1].type).toBe('presence.back');
+    expect(host.events[1].text).toContain('离开了 6 分钟'); // 从前这里会写「1 分钟」
+    at(720);
+    const out = await call(tools.presence_windows);
+    expect(out.text).toContain('离开键盘累计 6 分钟'); // 账本里的离开段也从那一刻起算
+  });
+
+  it('短离开回来只 piggyback；默认门槛 10 分钟，够久才叫醒', async () => {
+    const { sensor, host } = await setup({ awayAfterMs: 100 });
+    sensor.tick(50, WIN_A);
+    at(10);
+    sensor.tick(200, WIN_A); // 离开（真实起点 9.8s）
+    at(12);
+    sensor.tick(50, WIN_A); // 回来：离开 2.2 秒 → 不叫醒
+    expect(host.events.map((e) => e.type)).toEqual(['presence.away', 'presence.back']);
+    expect(host.pushOpts[0]?.trigger).toBe('piggyback');
+    expect(host.pushOpts[1]?.trigger).toBe('piggyback');
+    at(200);
+    sensor.tick(200, WIN_A); // 再离开（起点 199.8s）
+    at(860);
+    sensor.tick(50, WIN_A); // 回来：离开 11 分 → 叫醒
+    expect(host.events.map((e) => e.type)).toEqual([
+      'presence.away', 'presence.back', 'presence.away', 'presence.back',
+    ]);
+    expect(host.pushOpts[3]?.trigger).toBe('flush');
+  });
+
+  it('门槛可配：离开 4 秒配上 3 秒门槛就会叫醒', async () => {
+    const { sensor, host } = await setup({ awayAfterMs: 100, backWakeAfterMs: 3000 });
+    sensor.tick(50, WIN_A);
+    at(10);
+    sensor.tick(200, WIN_A); // 离开，起点 9.8s
+    at(14);
+    sensor.tick(50, WIN_A); // 回来：离开 4.2 秒 ≥ 3 秒 → 叫醒
+    expect(host.pushOpts[1]?.trigger).toBe('flush');
+  });
+
+  it('门槛设 0 = 每次回来都叫醒（老行为，留个出口）', async () => {
+    const { sensor, host } = await setup({ awayAfterMs: 100, backWakeAfterMs: 0 });
+    sensor.tick(50, WIN_A);
+    at(10);
+    sensor.tick(200, WIN_A);
+    at(12);
+    sensor.tick(50, WIN_A); // 离开 2.2 秒也叫醒
+    expect(host.pushOpts[1]?.trigger).toBe('flush');
   });
 });

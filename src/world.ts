@@ -14,7 +14,14 @@
  *   时账本照给。
  *
  * **「离开」不叫醒**（2026-10-13 他定的，四挡通用）：他离开时她通常没什么可做的，那条不值得打断她；
- * 事件照投（piggyback），随她下次开口一起到。「回来」照旧——ambient 那挡不叫醒，其余三挡当场叫醒。
+ * 事件照投（piggyback），随她下次开口一起到。「回来」要离开**够久**才叫醒（2026-10-14 他定的，
+ * 门槛是 `backWakeAfterMs`，默认 10 分钟，0 = 每次回来都叫醒）；ambient 那挡一直不叫醒。
+ *
+ * **两个时长都从「最后一次键鼠输入」算起**（2026-10-14 修）：判定离开的那一刻把 `awaySinceMs`
+ * 回填成 `now - idleMs`，所以「离开」正文写得明最后一次输入在几点，「回来」正文报的是真实离开时长。
+ * 从前它从「发现离开」那一刻起算，而发现本身就晚了整个 `awayAfterMs`——5 分钟的阈值会吐出
+ * 「离开了 30 秒」这种自相矛盾的数（工作区 `openM/presence-away-back-duration-2026-10-14.md`）。
+ * 注意事件**到达**仍然晚 `awayAfterMs`，那是阈值检测的固有代价；修的是它说的是几点，不是它几点到。
  *
  * 「关闭」是**投递静音，不是关掉这个世界**：传感器照采、两个工具照用，跟配置里的
  * `enabled:false`（整个 World 不启动）是两码事，提示词里点明了。
@@ -255,7 +262,9 @@ export class PresenceWorld implements World {
     const threshold = Math.max(0, this.opts.cfg.awayAfterMs);
     if (!this.away && tick.idleMs >= threshold) {
       this.away = true;
-      this.awaySinceMs = now;
+      // 采样里的空闲时长就是「已经离开多久」——用它把起点回填到最后一次键鼠输入那一刻。
+      // 否则报文与账本都从「发现离开」（本身已晚一整个阈值）起算，每次离开都少算 5 分钟。
+      this.awaySinceMs = tick.idleMs > 0 ? now - tick.idleMs : now;
       this.onAway('away', now);
     } else if (this.away && tick.idleMs < threshold) {
       this.away = false;
@@ -295,18 +304,22 @@ export class PresenceWorld implements World {
    * 离开 / 回来。四挡下都投**自己的事件名**（`presence.away` / `presence.back`）——不再混进
    * 窗口变化的批里。从前那条路会把单独一条离开错标成 `presence.switched`，2026-10-13 顺手修掉。
    *
-   * 叫醒规则（2026-10-13 他定的）：**「离开」不叫醒**（四挡通用）——他离开时她通常没什么可做的，
-   * 那条不值得打断她；事件照投，只是 piggyback。「回来」按挡位：ambient 不叫醒，其余三挡当场叫醒。
+   * 叫醒规则：**「离开」不叫醒**（2026-10-13 他定，四挡通用）——事件照投，只是 piggyback。
+   * **「回来」要离开够久才叫醒**（2026-10-14 他定）：短离开只 piggyback，免得为「他去倒杯水」
+   * 打断她；门槛 `backWakeAfterMs`（默认 10 分钟，0 = 每次回来都叫醒）。ambient 那挡一直不叫醒。
    * 压缩挡下这段离开还进摘要——时间线才完整。
    */
   private onAway(kind: 'away' | 'back', now: number): void {
+    const absenceMs = now - this.awaySinceMs; // 起点是最后一次键鼠输入，回填见 onTick
     const text =
       kind === 'away'
-        ? `[${clock(now)}] 离开键盘`
-        : `[${clock(now)}] 回到键盘，离开了 ${fmtDuration(now - this.awaySinceMs)}`;
-    // 「回来」那一刻把这段离开封进账本；「离开」那一刻不用记，起点就是现在。
+        ? `[${clock(now)}] 离开键盘（最后一次键鼠输入在 ${clock(this.awaySinceMs)}）`
+        : `[${clock(now)}] 回到键盘，离开了 ${fmtDuration(absenceMs)}`;
+    // 「回来」那一刻把这段离开封进账本；「离开」那一刻不封——起点已经回填到最后一次输入，
+    // 等「回来」或结账再落账（起点不早于进挡那一刻，由 pushLedger 把关）。
     if ((this.delivery === 'digest' || this.delivery === 'off') && kind === 'back') this.closeAwaySegment(this.awaySinceMs, now);
-    const trigger: TriggerMode = kind === 'away' || this.delivery === 'ambient' ? 'piggyback' : 'flush';
+    const longEnough = absenceMs >= Math.max(0, this.opts.cfg.backWakeAfterMs);
+    const trigger: TriggerMode = kind === 'away' || this.delivery === 'ambient' || !longEnough ? 'piggyback' : 'flush';
     void this.emit(kind === 'away' ? 'presence.away' : 'presence.back', text, trigger);
   }
 
@@ -772,7 +785,7 @@ export class PresenceWorld implements World {
     return {
       name: 'presence_set_mode',
       description:
-        'Set delivery mode (see Presence environment rules). Runtime-only; restart resets to digest with a 20-minute period. Away never wakes you; back wakes you except in ambient. off keeps the sensor and tools available.',
+        'Set delivery mode (see Presence environment rules). Runtime-only; restart resets to digest with a 20-minute period. Away never wakes you; back wakes you only when the absence was long enough (never in ambient). off keeps the sensor and tools available.',
       tags: ['act'],
       parameters: {
         type: 'object',
@@ -846,13 +859,14 @@ export class PresenceWorld implements World {
       return {
         text:
           `已切到 digest（压缩）：窗口变化只记账、不单独投；每 ${fmtMinutes(minutes)}给一份累计摘要（不叫醒），原始时间线可按需查询。` +
-          '他离开时只投不叫醒，回来时叫醒；离开时段也记进摘要。调 presence_windows 可立即结账。',
+          '他离开时只投不叫醒；回来要离开够久才叫醒（门槛是配置里的「回来叫醒门槛」，默认 10 分钟），' +
+          '更短的只随你下次开口一起到。离开时段也记进摘要，时长从最后一次键鼠输入算起。调 presence_windows 可立即结账。',
       };
     }
     if (mode === 'off') {
       return {
         text:
-          '已切到 off（关闭）：窗口活动只留档、不主动投。另报他离开（不叫醒）、回来（叫醒），' +
+          '已切到 off（关闭）：窗口活动只留档、不主动投。另报他离开（不叫醒）、回来（离开够久才叫醒），' +
           '和「切到一个本次运行第一次见到的程序」（不叫醒）。想看留档就调 presence_windows。' +
           '注意这是投递静音，不是关掉这个 World：传感器照看、截图照用。',
       };
@@ -862,6 +876,7 @@ export class PresenceWorld implements World {
       return {
         text:
           '已切到 call：窗口变化当场投、会叫醒你，3 秒内的连续变化并成一条。' +
+          '「回来」照旧要离开够久才叫醒（门槛是配置里的「回来叫醒门槛」）。' +
           (n > 0 ? `攒下的 ${n} 条已一并立即投出。` : ''),
       };
     }

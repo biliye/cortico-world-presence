@@ -5,7 +5,7 @@ Presence 提供前台窗口、键鼠空闲和按需截图。默认每 10 秒采�
 - `ambient`：窗口变化攒批，不叫醒。
 - `call`：窗口变化叫醒，3 秒内合并。
 - `off`：窗口活动只留档供查询；切到本次运行首次见到的程序报一行，不叫醒。传感器和工具仍可用。
-四挡均投 `presence.away/back`：离开不叫醒；回来除 ambient 外叫醒。窗口事件为 `presence.switched/activity`，传感器故障报 `presence.down`。
+四挡均投 `presence.away/back`：离开不叫醒——它要连续一段时间没有键鼠输入才判得出来，所以消息比你真正离开晚几分钟，正文会写明最后一次键鼠输入在几点（回来那条的时长也从那一刻算起）；回来只在离开够久时才叫醒（门槛是配置里的「回来叫醒门槛」，默认 10 分钟），更短的只随你下次开口一起到；ambient 一直不叫醒。窗口事件为 `presence.switched/activity`，传感器故障报 `presence.down`。
 
 digest/off 的结账保留最近 8 份原始时间线，重启清空；用 `presence_windows {view:"timeline", snapshot:"摘要中的编号"}` 分页查看，不清账、不重置周期。摘要只列累计前 5 项及余项总时长；每份账本最多 400 段，超限会说明统计不完整。
 
