@@ -2,8 +2,12 @@
   "name": "cortico-world-presence",
   "version": "0.1.0",
   "type": "module",
-  "description": "Cortico World: 在场感——前台窗口变化、离开/回来键盘、按需的窗口清单与截图",
+  "description": "Cortico World: 在场感（Windows 专用）——前台窗口变化、离开/回来键鼠、按需的窗口清单与截图",
   "license": "MIT",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "keywords": [
     "cortico-world",
     "cortico"
@@ -19,12 +23,14 @@
   },
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "prepublishOnly": "npm run typecheck && npm run test"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
