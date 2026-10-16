@@ -243,7 +243,7 @@ class CaptureHost {
       if (this.pending !== item) return;
       this.pending = null;
       this.kill();
-      item.reject(new Error(`PowerShell ${Math.round(timeoutMs / 1000)} 秒没跑完，被掐掉了`));
+      item.reject(new Error(`PowerShell ${timeoutLabel(timeoutMs)}没跑完，被掐掉了`));
       this.pump();
     }, timeoutMs);
     // 直接把定时器挂在**同一个对象**上：下面那几个回调要靠 `this.pending === item` 认人，
@@ -345,6 +345,11 @@ class CaptureHost {
     this.stdout = '';
     if (child && child.exitCode === null) child.kill();
   }
+}
+
+/** 超时那句里的时长：够一秒就说秒，不到就说毫秒（短超时只在测试里出现，但话说准没错）。 */
+function timeoutLabel(timeoutMs: number): string {
+  return timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)} 秒` : `${Math.round(timeoutMs)} 毫秒`;
 }
 
 function describeError(err: unknown): string {

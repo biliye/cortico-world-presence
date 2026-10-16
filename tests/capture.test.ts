@@ -276,7 +276,9 @@ maybe('常驻助手（真 PowerShell）', () => {
   });
 
   it('超时按「没跑完」报错，而且下一次调用照常（助手会另起一只）', async () => {
-    await expect(captureScreenshot(tiny, 1)).rejects.toThrow(/秒没跑完/);
+    // 配一条**注定跑不完**的请求：整屏抓屏在本机量过 190~250ms，给它 20ms 是十倍余量。
+    // 别用「小请求 + 1ms 超时」那种写法 —— 那是赛跑（2026-10-16 真红过一次：请求 5ms 就跑完了）。
+    await expect(captureScreenshot({ target: 'full' }, 20)).rejects.toThrow(/没跑完/);
     const shot = await captureScreenshot(tiny, 25000);
     expect(shot.width).toBe(64);
     expect(shot.height).toBe(64);
