@@ -1,5 +1,8 @@
 # cortico-world-presence
 
+> **要求 Cortico 0.2.0 及以上**(扩展契约 world 6,`cortico.api: 6`)。
+> 在 Cortico 0.1.x 上装它不会被加载。这一条是 0.2.0 起的要求 —— 0.1.x 那一版要求旧契约。
+
 Cortico 的「在场感」World:**它能判别你是否离开 / 回到电脑前**,也知道你正在用哪个窗口,想看的时候能截一张屏。
 Windows 专用(传感器与截图都走 Win32,经由系统自带的 PowerShell,零安装)。
 

@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-presence",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "description": "Cortico World: 在场感（Windows 专用）——能判别你是否离开/回到电脑前。★ 它会持续读前台窗口标题与键鼠空闲、并能截屏(屏幕上有什么截到什么),这些随模型调用发到你部署配置的模型端点;默认不启用。详细隐私说明见 README。",
   "license": "MIT",
@@ -30,6 +30,7 @@
   "files": [
     "src",
     "README.md",
+    "CHANGELOG.md",
     "describe.json",
     "LICENSE"
   ],
