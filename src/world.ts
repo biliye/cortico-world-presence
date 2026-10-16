@@ -35,9 +35,10 @@ import type {
   ToolCallContext,
   ToolDef,
   ToolOutcome,
+  ToolSpec,
   TriggerMode,
   World,
-  WorldConsoleDecl,
+  WorldWebUiDecl,
   WorldHost,
   WorldLamp,
 } from 'cortico/core/types.ts';
@@ -81,6 +82,88 @@ const MIN_POLL_MS = 2000;
 const WINDOW_RECEIPT_CAP = 40;
 /** 截图一次性进程的超时。 */
 const CAPTURE_TIMEOUT_MS = 20000;
+
+/**
+ * 三个工具的静态声明。发给模型的字段（description / parameters / tags）与实例方法共用同一份常量，
+ * 这样自描述（`describe`）和真发出去的那份不会各说各话；`handler` 留在方法里。
+ */
+const WINDOWS_DECL: ToolSpec = {
+  name: 'presence_windows',
+  description:
+    'List up to 40 windows with geometry and latest polled foreground/idle state. In digest/off, settle a compact summary (digest restarts its period); other modes drain pending activity. view=timeline reads saved raw segments without listing windows, clearing activity or resetting timers. Keeps the last 8 settlements in memory; restart loses them.',
+  tags: ['read'],
+  parameters: {
+    type: 'object', additionalProperties: false,
+    properties: {
+      view: { type: 'string', enum: ['summary', 'timeline'], description: '默认 summary；timeline 读取已结账的逐段记录。' },
+      snapshot: { type: 'string', description: '仅 timeline：摘要中的记录编号，省略取最近一次。' },
+      offset: { type: 'integer', minimum: 0, description: '仅 timeline：从第几段开始（从 0 起），默认 0。' },
+      limit: { type: 'integer', minimum: 1, maximum: 100, description: '仅 timeline：每页段数，默认 40。' },
+    },
+  },
+};
+
+const SCREENSHOT_DECL: ToolSpec = {
+  name: 'presence_screenshot',
+  description:
+    'Attach a PNG/JPEG screenshot. Priority: region (width + height, optional x/y) > hwnd > target. Use window rectangles to frame a small area; long edges over 1600px are downscaled. Receipt reports captured bounds, coordinate mapping and cursor status.',
+  tags: ['read'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      x: { type: 'integer', description: '区域左上 x，虚拟桌面物理像素，默认 0。' },
+      y: { type: 'integer', description: '区域左上 y，同一坐标系，默认 0，可为负数。' },
+      width: { type: 'integer', description: '区域宽，物理像素，至少 16；须同时给 height。' },
+      height: { type: 'integer', description: '区域高，物理像素，至少 16；须同时给 width。' },
+      hwnd: {
+        type: 'integer',
+        description: '已知的正整数窗口句柄，截整个窗口；区域优先。',
+      },
+      target: {
+        type: 'string',
+        enum: ['foreground', 'full'],
+        description: 'foreground：前台窗口（默认）；full：全部显示器。',
+      },
+      grid: {
+        type: 'boolean',
+        description:
+          '叠加标有桌面坐标的格线，默认 false；量坐标时使用。',
+      },
+      cursor: {
+        type: 'boolean',
+        description:
+          '默认 true，叠加系统光标；false 可减少遮字或比图干扰，仍报告可读到的光标坐标。',
+      },
+    },
+  },
+};
+
+const SET_MODE_DECL: ToolSpec = {
+  name: 'presence_set_mode',
+  description:
+    'Set delivery mode (see Presence environment rules). Runtime-only; restart resets to digest with a 20-minute period. Away never wakes you; back wakes you only when the absence was long enough (never in ambient). off keeps the sensor and tools available.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      mode: {
+        type: 'string',
+        enum: ['call', 'ambient', 'digest', 'off'],
+        description:
+          'digest：周期摘要；ambient：攒批；call：窗口变化叫醒；off：窗口留档，仅首次见到的程序另报一行。',
+      },
+      minutes: {
+        type: 'number',
+        description: 'digest 周期分钟数，正数，可为小数；省略沿用当前值（初始 20）。',
+      },
+    },
+    required: ['mode'],
+  },
+};
+
+export const PRESENCE_TOOL_DECLS: readonly ToolSpec[] = [WINDOWS_DECL, SCREENSHOT_DECL, SET_MODE_DECL];
 
 export interface PresenceWorldOptions {
   /** `worlds.presence` 的活引用：热改的键（awayAfterMs）现读即生效。 */
@@ -167,7 +250,7 @@ export class PresenceWorld implements World {
     return [this.windowsTool(), this.screenshotTool(), this.setModeTool()];
   }
 
-  console(): WorldConsoleDecl {
+  webUi(): WorldWebUiDecl {
     return {
       lamps: [this.lamp()],
       badges: [
@@ -527,19 +610,7 @@ export class PresenceWorld implements World {
 
   private windowsTool(): ToolDef {
     return {
-      name: 'presence_windows',
-      description:
-        'List up to 40 windows with geometry and latest polled foreground/idle state. In digest/off, settle a compact summary (digest restarts its period); other modes drain pending activity. view=timeline reads saved raw segments without listing windows, clearing activity or resetting timers. Keeps the last 8 settlements in memory; restart loses them.',
-      tags: ['read'],
-      parameters: {
-        type: 'object', additionalProperties: false,
-        properties: {
-          view: { type: 'string', enum: ['summary', 'timeline'], description: '默认 summary；timeline 读取已结账的逐段记录。' },
-          snapshot: { type: 'string', description: '仅 timeline：摘要中的记录编号，省略取最近一次。' },
-          offset: { type: 'integer', minimum: 0, description: '仅 timeline：从第几段开始（从 0 起），默认 0。' },
-          limit: { type: 'integer', minimum: 1, maximum: 100, description: '仅 timeline：每页段数，默认 40。' },
-        },
-      },
+      ...WINDOWS_DECL,
       handler: async (args: Record<string, unknown>, _ctx: ToolCallContext) => this.readWindows(args),
     };
   }
@@ -642,39 +713,7 @@ export class PresenceWorld implements World {
 
   private screenshotTool(): ToolDef {
     return {
-      name: 'presence_screenshot',
-      description:
-        'Attach a PNG/JPEG screenshot. Priority: region (width + height, optional x/y) > hwnd > target. Use window rectangles to frame a small area; long edges over 1600px are downscaled. Receipt reports captured bounds, coordinate mapping and cursor status.',
-      tags: ['read'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          x: { type: 'integer', description: '区域左上 x，虚拟桌面物理像素，默认 0。' },
-          y: { type: 'integer', description: '区域左上 y，同一坐标系，默认 0，可为负数。' },
-          width: { type: 'integer', description: '区域宽，物理像素，至少 16；须同时给 height。' },
-          height: { type: 'integer', description: '区域高，物理像素，至少 16；须同时给 width。' },
-          hwnd: {
-            type: 'integer',
-            description: '已知的正整数窗口句柄，截整个窗口；区域优先。',
-          },
-          target: {
-            type: 'string',
-            enum: ['foreground', 'full'],
-            description: 'foreground：前台窗口（默认）；full：全部显示器。',
-          },
-          grid: {
-            type: 'boolean',
-            description:
-              '叠加标有桌面坐标的格线，默认 false；量坐标时使用。',
-          },
-          cursor: {
-            type: 'boolean',
-            description:
-              '默认 true，叠加系统光标；false 可减少遮字或比图干扰，仍报告可读到的光标坐标。',
-          },
-        },
-      },
+      ...SCREENSHOT_DECL,
       handler: (args) => this.takeScreenshot(args),
     };
   }
@@ -783,27 +822,7 @@ export class PresenceWorld implements World {
 
   private setModeTool(): ToolDef {
     return {
-      name: 'presence_set_mode',
-      description:
-        'Set delivery mode (see Presence environment rules). Runtime-only; restart resets to digest with a 20-minute period. Away never wakes you; back wakes you only when the absence was long enough (never in ambient). off keeps the sensor and tools available.',
-      tags: ['act'],
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          mode: {
-            type: 'string',
-            enum: ['call', 'ambient', 'digest', 'off'],
-            description:
-              'digest：周期摘要；ambient：攒批；call：窗口变化叫醒；off：窗口留档，仅首次见到的程序另报一行。',
-          },
-          minutes: {
-            type: 'number',
-            description: 'digest 周期分钟数，正数，可为小数；省略沿用当前值（初始 20）。',
-          },
-        },
-        required: ['mode'],
-      },
+      ...SET_MODE_DECL,
       handler: (args) => this.setMode(args),
     };
   }

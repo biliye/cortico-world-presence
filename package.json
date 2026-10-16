@@ -24,11 +24,13 @@
   "main": "./src/index.ts",
   "cortico": {
     "kind": "world",
-    "api": 5
+    "api": 6,
+    "describe": "describe.json"
   },
   "files": [
     "src",
     "README.md",
+    "describe.json",
     "LICENSE"
   ],
   "scripts": {

@@ -1,0 +1,183 @@
+{
+  "tools": [
+    {
+      "name": "presence_windows",
+      "description": "List up to 40 windows with geometry and latest polled foreground/idle state. In digest/off, settle a compact summary (digest restarts its period); other modes drain pending activity. view=timeline reads saved raw segments without listing windows, clearing activity or resetting timers. Keeps the last 8 settlements in memory; restart loses them.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "view": {
+            "type": "string",
+            "enum": [
+              "summary",
+              "timeline"
+            ],
+            "description": "默认 summary；timeline 读取已结账的逐段记录。"
+          },
+          "snapshot": {
+            "type": "string",
+            "description": "仅 timeline：摘要中的记录编号，省略取最近一次。"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "仅 timeline：从第几段开始（从 0 起），默认 0。"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "仅 timeline：每页段数，默认 40。"
+          }
+        }
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "看窗口清单与在场状态；timeline 翻阅已结账的逐段记录，在压缩挡下还顺手结一次账。",
+        "en": "Lists windows with foreground/idle state; view=timeline reads settled per-segment records and settles the digest period."
+      }
+    },
+    {
+      "name": "presence_screenshot",
+      "description": "Attach a PNG/JPEG screenshot. Priority: region (width + height, optional x/y) > hwnd > target. Use window rectangles to frame a small area; long edges over 1600px are downscaled. Receipt reports captured bounds, coordinate mapping and cursor status.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "type": "integer",
+            "description": "区域左上 x，虚拟桌面物理像素，默认 0。"
+          },
+          "y": {
+            "type": "integer",
+            "description": "区域左上 y，同一坐标系，默认 0，可为负数。"
+          },
+          "width": {
+            "type": "integer",
+            "description": "区域宽，物理像素，至少 16；须同时给 height。"
+          },
+          "height": {
+            "type": "integer",
+            "description": "区域高，物理像素，至少 16；须同时给 width。"
+          },
+          "hwnd": {
+            "type": "integer",
+            "description": "已知的正整数窗口句柄，截整个窗口；区域优先。"
+          },
+          "target": {
+            "type": "string",
+            "enum": [
+              "foreground",
+              "full"
+            ],
+            "description": "foreground：前台窗口（默认）；full：全部显示器。"
+          },
+          "grid": {
+            "type": "boolean",
+            "description": "叠加标有桌面坐标的格线，默认 false；量坐标时使用。"
+          },
+          "cursor": {
+            "type": "boolean",
+            "description": "默认 true，叠加系统光标；false 可减少遮字或比图干扰，仍报告可读到的光标坐标。"
+          }
+        }
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "截一张图（区域优先，其次窗口，再按 target）；量坐标时用 grid，想少干扰就 cursor:false。",
+        "en": "Captures a screenshot (region > hwnd > target); grid overlays desktop coordinates, cursor:false drops the cursor overlay."
+      }
+    },
+    {
+      "name": "presence_set_mode",
+      "description": "Set delivery mode (see Presence environment rules). Runtime-only; restart resets to digest with a 20-minute period. Away never wakes you; back wakes you only when the absence was long enough (never in ambient). off keeps the sensor and tools available.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "call",
+              "ambient",
+              "digest",
+              "off"
+            ],
+            "description": "digest：周期摘要；ambient：攒批；call：窗口变化叫醒；off：窗口留档，仅首次见到的程序另报一行。"
+          },
+          "minutes": {
+            "type": "number",
+            "description": "digest 周期分钟数，正数，可为小数；省略沿用当前值（初始 20）。"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "改投递姿势：digest 周期摘要／ambient 攒批／call 变化就叫醒／off 只留档，分钟数可现改。",
+        "en": "Sets the delivery mode and, for digest, its period in minutes."
+      }
+    }
+  ],
+  "events": [
+    {
+      "type": "presence.down",
+      "description": {
+        "zh": "眼睛坏了：传感器起不来或中途退出，她需要知道现在看不见桌面。",
+        "en": "The sensor failed to start or died; the desktop is no longer being watched."
+      }
+    },
+    {
+      "type": "presence.away",
+      "description": {
+        "zh": "他离开电脑前了（只投、不叫醒；时长从最后一次键鼠输入算）。",
+        "en": "He stepped away from the machine; delivered without waking, timed from the last input."
+      }
+    },
+    {
+      "type": "presence.back",
+      "description": {
+        "zh": "他回来了（离开够久才叫醒，门槛是 backWakeAfterMs）。",
+        "en": "He came back; wakes only when the absence passed backWakeAfterMs."
+      }
+    },
+    {
+      "type": "presence.switched",
+      "description": {
+        "zh": "前台窗口换了一个，或本次运行第一次见到某个程序。",
+        "en": "The foreground window changed, or a program was seen for the first time this run."
+      }
+    },
+    {
+      "type": "presence.digest",
+      "description": {
+        "zh": "压缩挡到点结账：这一周期的窗口停留与切换折成一份摘要，不叫醒。",
+        "en": "One digest period settled into a compact summary; does not wake."
+      }
+    },
+    {
+      "type": "presence.activity",
+      "description": {
+        "zh": "多条变化攒在一起合成的一条（环境批或 call 挡的合并批）。",
+        "en": "Several changes coalesced into one line (ambient batch or the call-mode coalescing window)."
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "key": "worlds.presence.envPrompt",
+      "title": "Presence · 环境提示词",
+      "role": "envPrompt",
+      "content": "Presence 提供前台窗口、键鼠空闲和按需截图。默认每 10 秒采样，可能漏掉两次采样间的切换；没收到事件不代表没变化。空闲不等于人已离开，窗口标题或停留时长不证明他在阅读。标题带「塞斯普瑞」的控制台是你自己的界面。\n\n投递由 `presence_set_mode` 切换，运行态，重启回 `digest`：\n- `digest`：默认每 20 分钟投 `presence.digest`，列应用/窗口累计停留、观测切换数和最近状态，不叫醒。零切换仍计停留；离开时长与前台停留重叠，不能相加当工作时长。`presence_windows` 可立即结账并重开周期。\n- `ambient`：窗口变化攒批，不叫醒。\n- `call`：窗口变化叫醒，3 秒内合并。\n- `off`：窗口活动只留档供查询；切到本次运行首次见到的程序报一行，不叫醒。传感器和工具仍可用。\n四挡均投 `presence.away/back`：离开不叫醒——它要连续一段时间没有键鼠输入才判得出来，所以消息比你真正离开晚几分钟，正文会写明最后一次键鼠输入在几点（回来那条的时长也从那一刻算起）；回来只在离开够久时才叫醒（门槛是配置里的「回来叫醒门槛」，默认 10 分钟），更短的只随你下次开口一起到；ambient 一直不叫醒。窗口事件为 `presence.switched/activity`，传感器故障报 `presence.down`。\n\ndigest/off 的结账保留最近 8 份原始时间线，重启清空；用 `presence_windows {view:\"timeline\", snapshot:\"摘要中的编号\"}` 分页查看，不清账、不重置周期。摘要只列累计前 5 项及余项总时长；每份账本最多 400 段，超限会说明统计不完整。\n\n了解窗口与活动先用 `presence_windows`，需要画面再截图。图片会随后续模型请求重发，直到对应回执被裁出上下文；把重要观察写成文字不会删除图片，也不保证文字永久保留。\n\n截图坐标是虚拟桌面物理像素，主屏左上为 (0,0)，副屏可为负数。区域超出虚拟屏会被裁切；长边超过 1600 会缩小，小字宜截小区域。按回执的原点与比例换算图上坐标，不能直接当桌面坐标；`grid:true` 的格线标的是桌面坐标。区域/抓屏包含遮挡，`hwnd` 的 PrintWindow 是窗口自己绘的帧。\n\n光标位置是抓屏前的采样，不代表现在的位置或点击成功；形状仅供参考。没有箭头不代表光标不在此处：看回执区分未叠加、隐藏、区域外、PrintWindow 或读取失败。`cursor:false` 只关闭叠画，仍尝试报告坐标；读小字或比较区域变化时可用。\n\n同一区域的“相同/变化”只比较输出图像字节，不判断任务成功；时钟、视频、格线、光标及截图选项都可能影响结果。即使相同仍返回图片。锁屏、UAC、DRM 或最小化窗口可能无法截图；失败不等于没有内容，可按需改用可用的 OCR/窗口查询。窗口标题与截图会发送至部署配置的模型端点。\n"
+    }
+  ]
+}
