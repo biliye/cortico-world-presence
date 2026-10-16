@@ -52,6 +52,7 @@ import {
   describeShotGeometry,
   listWindows,
   parseRegion,
+  stopCaptureHost,
   type CaptureOptions,
   type Rect,
   type ScreenshotResult,
@@ -312,6 +313,9 @@ export class PresenceWorld implements World {
     const sensor = this.sensor;
     this.sensor = null;
     sensor?.stop();
+    // 截图那只常驻助手也一起收掉：它的脚本里有截屏能力，World 卸了不该留着它。
+    // 不抛错；等着的请求会按失败交回（见 capture.ts 的 StopCaptureHost）。
+    await stopCaptureHost();
     this.clearSwitchTimer();
     this.clearDigestTimer();
     // call 模式攒着的合并行并进 ambient 批一起投，不丢账。

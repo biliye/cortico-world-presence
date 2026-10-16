@@ -1,11 +1,14 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
-  captureScript,
+  captureHostSpawns,
   captureScreenshot,
   describeShotCursor,
   describeShotGeometry,
   gridStepFor,
   listWindows,
+  stopCaptureHost,
 } from '../src/capture.ts';
 
 /** 真截屏与列窗口只在 Windows 桌面会话里跑得动。 */
@@ -139,36 +142,35 @@ describe('图上的光标（纯函数）', () => {
 });
 
 /**
- * 命令行的天花板。
+ * 助手脚本现在是**包内一份 `.ps1`**（`src/capture-host.ps1`），用 `-File` 跑。
  *
- * 这个脚本是**编码成一行塞在命令行上**跑的(`-EncodedCommand`,UTF-16 再 base64 ⇒ 源文本的 2.67 倍)，
- * 而 Windows 的命令行约 32767 字符。顶过去的表现是 **`spawn ENAMETOOLONG`**——一条完全看不出跟
- * 「你多写了几行注释」有关的报错(2026-10-07 就是这么红的:往模板里加了段解释,编码后 33003 字节)。
+ * 为什么不再塞在命令行上（`-EncodedCommand`）：两段脚本合起来编码后 **43952 字节**，
+ * 而 Windows 命令行的上限约 **32767** —— 顶过去就是 `spawn ENAMETOOLONG`
+ * （2026-10-07 就是这么红的：往模板里加了一段解释，编码后 33003）。改成读文件之后没有这个上限，
+ * 而且它在盘上是一份**可读、可以加进杀软白名单**的文件。
  *
- * 为什么不改成「写个临时 .ps1 用 -File 跑」:那正是 `-EncodedCommand` 在这里的理由——**脚本里有中文
- * (给她的错误文案)**,而无 BOM 的 UTF-8 会被 PowerShell 5.1 按 ANSI 读成乱码。所以脚本必须待在上限之内,
- * 解释就该写在 TypeScript 这一侧(不花预算)。
- *
- * 这条用例把「还剩多少」钉住:谁往模板里加东西,在离上限还有余量的时候就红,而不是运行时炸。
+ * 盯两件事，都是「真跑起来之前看不出来」的那种坏法：
+ * - **BOM**：脚本里有中文（给她的错误文案），无 BOM 的 UTF-8 会被 Windows PowerShell 5.1
+ *   按系统 ANSI 读成乱码；
+ * - **它得跟着包走**：`files` 覆盖到 `src/`，发布出去的包里才有这份文件。
  */
-describe('截屏脚本的命令行预算（纯函数）', () => {
-  const RESERVE = 2048;
-  const encodedLength = (target: Parameters<typeof captureScript>[0]) => {
-    const candidates = [
-      captureScript(target, true, true),
-      captureScript(target, false, false),
-    ];
-    return Math.max(...candidates.map((s) => Buffer.from(s, 'utf16le').toString('base64').length));
-  };
+describe('助手脚本（包内文件）', () => {
+  const scriptPath = fileURLToPath(new URL('../src/capture-host.ps1', import.meta.url));
 
-  it('全屏那条（最长的一份）编码后仍在上限之内，并且留着余量', () => {
-    const encoded = encodedLength({ target: 'full' });
-    expect(32767 - encoded, `命令行还剩 ${32767 - encoded} 字节;注释也算在预算里`).toBeGreaterThan(RESERVE);
+  it('存在、带 UTF-8 BOM，且中文读得出来（不是乱码）', () => {
+    const bytes = readFileSync(scriptPath);
+    expect(bytes.subarray(0, 3), '缺 UTF-8 BOM ⇒ PowerShell 5.1 会把中文按 ANSI 读成乱码').toEqual(
+      Buffer.from([0xef, 0xbb, 0xbf]),
+    );
+    const text = bytes.subarray(3).toString('utf8');
+    expect(text).toContain('这块区域不在屏幕上');
+    expect(text).toContain('function Invoke-Capture');
+    expect(text).toContain('function Invoke-Windows');
   });
 
-  it('区域那条带上坐标（负数与多位数字）也一样', () => {
-    const encoded = encodedLength({ target: 'region', region: { x: -1234, y: -1234, width: 4321, height: 4321 } });
-    expect(32767 - encoded).toBeGreaterThan(RESERVE);
+  it('命令行只剩参数（脚本不再走 -EncodedCommand，也没有别的地方塞长脚本）', () => {
+    const encoded = Buffer.from(readFileSync(scriptPath, 'utf8'), 'utf16le').toString('base64').length;
+    expect(encoded, '它已经不经过命令行了，这条只是提醒：别再把它塞回去').toBeGreaterThan(32767);
   });
 });
 
@@ -256,4 +258,44 @@ maybe('截图与列窗口（真 PowerShell）', () => {
     // 画上去的东西必须改变这张图；连字节都一样就是根本没画（「真的画上去了」只能这么验）
     expect(Buffer.compare(plain.bytes, grid.bytes)).not.toBe(0);
   }, 60000);
+});
+
+/**
+ * 常驻助手本身（真 PowerShell）：**复用**与**坏了以后还能用**这两件事必须钉住 ——
+ * 前者是这次改动的全部意义（不再是每次起一个进程），后者是「杀软拦了一下」之后的表现。
+ */
+maybe('常驻助手（真 PowerShell）', () => {
+  const tiny = { target: 'region', region: { x: 0, y: 0, width: 64, height: 64 } } as const;
+
+  it('连着两次调用只用一只助手，不是每次都起一个进程', async () => {
+    await captureScreenshot(tiny, 25000);
+    const after = captureHostSpawns();
+    await captureScreenshot(tiny, 25000);
+    await listWindows(15000);
+    expect(captureHostSpawns(), '复用失败：第二次调用又起了一只').toBe(after);
+  });
+
+  it('超时按「没跑完」报错，而且下一次调用照常（助手会另起一只）', async () => {
+    await expect(captureScreenshot(tiny, 1)).rejects.toThrow(/秒没跑完/);
+    const shot = await captureScreenshot(tiny, 25000);
+    expect(shot.width).toBe(64);
+    expect(shot.height).toBe(64);
+  });
+
+  it('World 收工调 stopCaptureHost 之后，下一次调用会另起一只并成功', async () => {
+    await captureScreenshot(tiny, 25000);
+    const before = captureHostSpawns();
+    await stopCaptureHost();
+    const shot = await captureScreenshot(tiny, 25000);
+    expect(shot.width).toBeGreaterThan(0);
+    expect(captureHostSpawns()).toBe(before + 1);
+  });
+
+  it('收工时等着的请求按失败交回，不会永远挂着', async () => {
+    const inflight = captureScreenshot(tiny, 25000);
+    const queued = listWindows(15000);
+    await stopCaptureHost();
+    await expect(inflight).rejects.toThrow();
+    await expect(queued).rejects.toThrow();
+  });
 });

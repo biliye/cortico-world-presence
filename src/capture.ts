@@ -1,12 +1,16 @@
 /**
- * 按需的一次性 PowerShell：截屏与列窗口。不走常驻传感器——她说要才发生，
- * 进程用完即退。回执里始终带 `via`（走的哪条路）与 `captured`（实际抓的区域），
- * 截不了就报错原因，不返黑图装成功。
+ * 截图与列窗口：一只**常驻的** PowerShell 助手，一问一答。
+ *
+ * 为什么不是「她说要才起一个、用完即退」（2026-10-16 改）：那台机器上的杀软对
+ * 「每次现编一段脚本 + 立刻抓屏」这条形状判得时松时紧。现在脚本只在助手启动时编译一次，
+ * 之后每次调用只是往它的 stdin 里写一行 JSON。理由与代价写在 `CaptureHost` 上面；
+ * 脚本本体在 `capture-host.ps1`（包内文件，`-File` 跑，必须是 UTF-8 BOM）。
  *
  * 坐标一律是**物理像素**、**虚拟屏坐标**（主屏左上为原点，主屏左边的显示器是负坐标）。
- * 这两个脚本开头都声明 DPI 感知，所以上报的窗口矩形与区域坐标同一个坐标系。
+ * 脚本开头声明 DPI 感知，所以上报的窗口矩形与区域坐标同一个坐标系。
  */
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 /** 截图的最长边（像素），超过就等比降采样。再大只是烧 token。 */
 export const SCREENSHOT_MAX_EDGE = 1600;
@@ -141,435 +145,222 @@ export interface WindowList {
   screen: ScreenInfo;
 }
 
-const POWER_SHELL_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'];
-
-function encodeCommand(script: string): string {
-  return Buffer.from(script, 'utf16le').toString('base64');
-}
-
-/** 跑一段一次性 PowerShell，解析 stdout 里的第一行 JSON。超时杀进程。 */
-function runPowerShellJson(script: string, timeoutMs: number): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('powershell.exe', [...POWER_SHELL_ARGS, encodeCommand(script)], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error(`PowerShell ${Math.round(timeoutMs / 1000)} 秒没跑完，被掐掉了`));
-    }, timeoutMs);
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(new Error(`PowerShell 起不来：${err.message}`));
-    });
-    child.on('close', () => {
-      clearTimeout(timer);
-      for (const line of stdout.split('\n')) {
-        const text = line.trim();
-        if (!text.startsWith('{')) continue;
-        try {
-          resolve(JSON.parse(text) as Record<string, unknown>);
-          return;
-        } catch {
-          // 不是完整 JSON 的行，继续找
-        }
-      }
-      reject(new Error(`PowerShell 没吐出结果${stderr ? `：${stderr.slice(-400)}` : ''}`));
-    });
-  });
-}
+/**
+ * 常驻的 PowerShell 助手：**脚本只编译一次，之后一问一答走 stdin/stdout**。
+ *
+ * 为什么不再「每次现编一段」（2026-10-16 改）：
+ *
+ * - **杀软对「现编 + 立刻抓屏」这条形状的判定不稳**。同一天里同一个包，窗口清单那条一直是通的，
+ *   截图那条时而通过、时而被拦 —— 报的是 PowerShell 的 `ScriptContainedMaliciousContent`
+ *   （AMSI：此脚本包含恶意内容，已被防病毒软件阻止运行），而机器上跑着电脑管家与火绒。
+ *   对照物有两条：本包**传感器**（也是常驻 PowerShell）全程没事；mouse 那只**常驻**的手/眼
+ *   在同样的拦截窗口里也没事。⇒ 形状是「现编 vs 常驻」，不是「抓屏本身被禁」。
+ * - 顺带把每次调用都付一遍的冷启动（PowerShell 起进程 + `Add-Type` 现编译 C#，量过 1.4~2.9 秒）省掉。
+ *
+ * 代价与边界（写清楚，别让它变成猜）：
+ * - **一次只跑一个请求**（FIFO 排队）：截图与清单共用一个进程，抓屏与枚举同时进行没有意义，
+ *   排队比并发安全。超时会**杀掉助手再重起**——半路抓屏没法在进程内取消，杀进程是唯一可靠的做法。
+ * - 助手崩了/被拦了不报假成功：那一次请求按「没吐出结果」失败，下一次调用会另起一只。
+ * - 请求与应答都是**一行一条 JSON**；除这一行以外的东西（PowerShell 的 CLIXML 噪声）走 stderr。
+ */
 
 /**
- * 截屏脚本。target、区域坐标与两个开关是模板里插进去的常量；出错输出 `{ok:false,error}`，不抛裸栈。
+ * 助手脚本住在包里（`src/capture-host.ps1`），用 `-File` 跑。
  *
- * **导出是为了测试**:它是 `-EncodedCommand` 传上去的,而**命令行有长度上限**
- * (`windows` 约 32767 字符,UTF-16 再 base64 会把脚本放大 2.67 倍),所以 `capture.test.ts` 里有一条
- * 用例盯着它的编码后长度。**写进这个模板的每个字都要按 2.67 倍算钱**——解释写在 TS 这边,
- * 模板里只留短指引(2026-10-07 就是这么被 `spawn ENAMETOOLONG` 顶回来的)。
- *
- * 图上的光标(2026-10-07 加,理由写在 TS 这边而不是模板里):
- * - 抓屏拍不到光标本身(量过:围着光标框一张 PNG,图里没有箭头),而看图干活的模型没有别的办法
- *   知道光标在哪,所以用 `GetCursorInfo` 读位置与位图、`DrawIconEx` 画上去。形状是系统真光标,
- *   于是它还顺带回答「这一点上是什么」(I 形=能打字,沙漏=忙)。
- * - **画在降采样与格线之后**,按画面比例缩但最小 16px(跟着一起缩的话,被压过的大图上它会糊成一个点);
- *   **只画真抓屏的图**——`hwnd` 那条走 `PrintWindow`,那是窗口自己绘的帧(可能被盖着、光标不在上面),
- *   画上去就是骗人。
- * - **她可以不要箭头**(`cursor:false`)——盯一块看变化、或读那一块小字时:光标正好停在框里的话,
- *   一个会动的箭头让「和上次像素级完全相同」永远说不出口,也会盖住字。**位置照读照报**,可选的只有箭头。
- * - 四种「没画」各有各的说法(她说了不要箭头 / 系统把光标藏了 / 光标不在这块 / 这张不是抓屏来的 /
- *   读不出来),一句话对应一种下一步动作,所以她不该靠猜。
+ * 为什么不是「把脚本 base64 塞在命令行上」（`-EncodedCommand`）：两段脚本合起来编码后 **43952 字节**，
+ * 而 Windows 命令行的上限约 **32767** —— 顶过去就是 `spawn ENAMETOOLONG`。读文件之后没有这个上限，
+ * 而且**它在盘上是一份可读、可以加白名单的文件**（命令行里一段 base64 + P/Invoke 正是杀软最爱盯的形状）。
+ * 这份 `.ps1` **必须带 UTF-8 BOM**：脚本里有中文（给她的错误文案），无 BOM 的 UTF-8 会被
+ * Windows PowerShell 5.1 按系统 ANSI 读成乱码 —— `capture.test.ts` 有一条用例盯着它。
  */
-export function captureScript(target: ScreenshotTarget, grid: boolean, drawCursor: boolean): string {
-  const kind = target.target;
-  const hwnd = target.target === 'window' ? String(Math.trunc(target.hwnd)) : '0';
-  const rx = target.target === 'region' ? String(Math.trunc(target.region.x)) : '0';
-  const ry = target.target === 'region' ? String(Math.trunc(target.region.y)) : '0';
-  const rw = target.target === 'region' ? String(Math.trunc(target.region.width)) : '0';
-  const rh = target.target === 'region' ? String(Math.trunc(target.region.height)) : '0';
-  return `
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-function Out-Json($obj) { $obj | ConvertTo-Json -Compress -Depth 6 | Write-Output }
-# 把位图编码成 JPEG。先铺一层白底再画，免得带 alpha 的窗口在 JPEG 里变成黑块。
-function Get-JpegBytes($bitmap) {
-  $flat = New-Object System.Drawing.Bitmap -ArgumentList $bitmap.Width, $bitmap.Height, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
-  $g = [System.Drawing.Graphics]::FromImage($flat)
-  $g.Clear([System.Drawing.Color]::White)
-  $g.DrawImage($bitmap, 0, 0, $bitmap.Width, $bitmap.Height)
-  $g.Dispose()
-  $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
-  $params = New-Object System.Drawing.Imaging.EncoderParameters 1
-  $params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality), ${JPEG_QUALITY}
-  $ms = New-Object System.IO.MemoryStream
-  $flat.Save($ms, $codec, $params)
-  $out = $ms.ToArray()
-  $ms.Dispose()
-  $flat.Dispose()
-  return $out
+const HOST_SCRIPT = fileURLToPath(new URL('./capture-host.ps1', import.meta.url));
+const HOST_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', HOST_SCRIPT];
+
+interface HostRequest {
+  command: Record<string, unknown>;
+  timeoutMs: number;
+  resolve: (value: Record<string, unknown>) => void;
+  reject: (error: Error) => void;
 }
 
-try {
-  Add-Type -AssemblyName System.Windows.Forms | Out-Null
-  Add-Type -AssemblyName System.Drawing | Out-Null
-  Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public static class PresenceCap {
-  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
-  [StructLayout(LayoutKind.Sequential)] public struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public POINT ptScreenPos; }
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, ref RECT rect);
-  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
-  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-  [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
-  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RECT rect, int sizeOfRect);
-  // The pointer. A screen grab does not contain the cursor (measured 2026-10-06), so it is drawn on.
-  [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO info);
-  [DllImport("user32.dll")] public static extern bool DrawIconEx(IntPtr hdc, int xLeft, int yTop, IntPtr hIcon, int cxWidth, int cyWidth, int istepIfAniCur, IntPtr hbrFlickerFreeDraw, int diFlags);
-  // 13 = SM_CXCURSOR, 14 = SM_CYCURSOR: the system cursor's own size at the current DPI.
-  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
-}
-'@ | Out-Null
-  try { [void][PresenceCap]::SetProcessDpiAwareness(2) } catch { try { [void][PresenceCap]::SetProcessDPIAware() } catch {} }
+/** 在飞的那一个：请求本身 + 它那个超时定时器。 */
+type HostPending = HostRequest & { timer: ReturnType<typeof setTimeout> };
 
-  $kind = '${kind}'
-  $hwndGiven = ${hwnd}
-  $maxEdge = ${SCREENSHOT_MAX_EDGE}
-  $title = ''
-  $rect = $null
-  $h = [IntPtr]::Zero
-  $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
-  if ($vs.Width -le 0 -or $vs.Height -le 0) { throw '拿不到屏幕尺寸' }
+/**
+ * 助手进程 + 排队。
+ *
+ * 一次只跑一个请求：截图与列窗口共用一个进程，**抓屏与枚举同时进行没有意义**，排队比并发安全，
+ * 也让「一行命令一行结果」这条协议不用做请求 id 配对。超时/进程没了都会**杀掉重起**——
+ * 半路抓屏没法在进程内取消，杀进程是唯一可靠的做法，而那一次请求按失败报，不报假成功。
+ */
+class CaptureHost {
+  private child: ChildProcess | null = null;
+  private stdout = '';
+  private stderr = '';
+  private pending: HostPending | null = null;
+  private readonly queue: HostRequest[] = [];
+  private spawns = 0;
 
-  if ($kind -eq 'full') {
-    $rect = @{ x = $vs.Left; y = $vs.Top; w = $vs.Width; h = $vs.Height }
-  } elseif ($kind -eq 'region') {
-    # 按虚拟屏夹紧:她框到屏幕外面时不算错，夹回来并在回执里说清实际抓的是哪一块。
-    $cl = [Math]::Max(${rx}, $vs.Left)
-    $ct = [Math]::Max(${ry}, $vs.Top)
-    $cr = [Math]::Min(${rx} + ${rw}, $vs.Left + $vs.Width)
-    $cb = [Math]::Min(${ry} + ${rh}, $vs.Top + $vs.Height)
-    $cw = $cr - $cl
-    $chh = $cb - $ct
-    if ($cw -le 0 -or $chh -le 0) {
-      throw "这块区域不在屏幕上。虚拟屏范围:x=$($vs.Left) y=$($vs.Top) 宽=$($vs.Width) 高=$($vs.Height)"
-    }
-    $rect = @{ x = $cl; y = $ct; w = $cw; h = $chh }
-  } else {
-    if ($kind -eq 'foreground') {
-      $h = [PresenceCap]::GetForegroundWindow()
-      if ($h -eq [IntPtr]::Zero) { throw '现在没有前台窗口（可能正锁屏）' }
-    } else {
-      $h = [IntPtr]$hwndGiven
-      if (-not [PresenceCap]::IsWindowVisible($h)) { throw '这个窗口现在不可见，可能已经关了' }
-    }
-    $sb = New-Object System.Text.StringBuilder 512
-    [void][PresenceCap]::GetWindowText($h, $sb, 512)
-    $title = $sb.ToString()
-    if ([PresenceCap]::IsIconic($h)) { throw '窗口已最小化，截不到内容' }
-    $r = New-Object 'PresenceCap+RECT'
-    $hr = [PresenceCap]::DwmGetWindowAttribute($h, 9, [ref]$r, [System.Runtime.InteropServices.Marshal]::SizeOf($r))
-    if ($hr -ne 0 -or ($r.Right - $r.Left) -le 0) {
-      $r = New-Object 'PresenceCap+RECT'
-      [void][PresenceCap]::GetWindowRect($h, [ref]$r)
-    }
-    $w = $r.Right - $r.Left
-    $bh = $r.Bottom - $r.Top
-    if ($w -le 0 -or $bh -le 0) { throw '拿不到窗口尺寸' }
-    $rect = @{ x = $r.Left; y = $r.Top; w = $w; h = $bh }
+  /** 到现在为止起过几只助手（读数只增不减，测试用它钉住「复用」这件事）。 */
+  spawnCount(): number {
+    return this.spawns;
   }
 
-  # Pointer read BEFORE the grab: the sample closest to the frame is the honest one.
-  $curOk = $false
-  $curX = 0
-  $curY = 0
-  $curShown = $false
-  $curIcon = [IntPtr]::Zero
-  $ci = New-Object 'PresenceCap+CURSORINFO'
-  $ci.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($ci)
-  if ([PresenceCap]::GetCursorInfo([ref]$ci)) {
-    $curOk = $true
-    $curX = $ci.ptScreenPos.X
-    $curY = $ci.ptScreenPos.Y
-    $curIcon = $ci.hCursor
-    # flags: 1 = CURSOR_SHOWING. The system hides the pointer itself for fullscreen video.
-    $curShown = (($ci.flags -band 1) -ne 0)
+  /** 一问一答。失败抛错，错误文案给人看（World 原样放进回执）。 */
+  request(command: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ command, timeoutMs, resolve, reject });
+      this.pump();
+    });
   }
 
-  $via = ''
-  $src = $null
-  if ($kind -eq 'window') {
-    $src = New-Object System.Drawing.Bitmap -ArgumentList $rect.w, $rect.h
-    $g = [System.Drawing.Graphics]::FromImage($src)
-    $hdc = $g.GetHdc()
-    $ok = [PresenceCap]::PrintWindow($h, $hdc, 2)
-    $g.ReleaseHdc($hdc)
-    $g.Dispose()
-    if ($ok) {
-      $via = 'printwindow'
-    } else {
-      $src.Dispose()
-      $src = $null
+  /** 收工：等着的全按失败交回，再杀掉助手。不抛错。 */
+  async stop(): Promise<void> {
+    const why = new Error('World 收工了，助手已经收掉');
+    const pending = this.pending;
+    this.pending = null;
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.reject(why);
+    }
+    for (const item of this.queue.splice(0)) item.reject(why);
+    this.kill();
+  }
+
+  /** 取下一个请求跑。同一时刻只有一个在飞。 */
+  private pump(): void {
+    if (this.pending || this.queue.length === 0) return;
+    const item = this.queue.shift()!;
+    const child = this.ensureChild();
+    if (!child) {
+      item.reject(new Error(this.lastStartError ?? 'PowerShell 起不来'));
+      this.pump();
+      return;
+    }
+    const timeoutMs = item.timeoutMs;
+    this.stdout = '';
+    const timer = setTimeout(() => {
+      if (this.pending !== item) return;
+      this.pending = null;
+      this.kill();
+      item.reject(new Error(`PowerShell ${Math.round(timeoutMs / 1000)} 秒没跑完，被掐掉了`));
+      this.pump();
+    }, timeoutMs);
+    // 直接把定时器挂在**同一个对象**上：下面那几个回调要靠 `this.pending === item` 认人，
+    // 换成 `{ ...item, timer }` 就等于每处都对不上（这条也是测试抓出来的）。
+    const pendingItem = item as HostPending;
+    pendingItem.timer = timer;
+    this.pending = pendingItem;
+    try {
+      child.stdin?.write(`${JSON.stringify(item.command)}\n`);
+    } catch (err) {
+      clearTimeout(timer);
+      this.pending = null;
+      this.kill();
+      item.reject(new Error(`命令送不进助手：${describeError(err)}`));
+      this.pump();
     }
   }
-  if ($null -eq $src) {
-    $src = New-Object System.Drawing.Bitmap -ArgumentList $rect.w, $rect.h
-    $g = [System.Drawing.Graphics]::FromImage($src)
-    [void]$g.CopyFromScreen($rect.x, $rect.y, 0, 0, (New-Object System.Drawing.Size -ArgumentList $rect.w, $rect.h))
-    $g.Dispose()
-    $via = 'screen'
+
+  private lastStartError: string | undefined;
+
+  private ensureChild(): ChildProcess | null {
+    if (this.child && this.child.exitCode === null && !this.child.killed) return this.child;
+    this.child = null;
+    this.stdout = '';
+    this.stderr = '';
+    this.lastStartError = undefined;
+    let child: ChildProcess;
+    try {
+      child = spawn('powershell.exe', HOST_ARGS, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    } catch (err) {
+      this.lastStartError = `PowerShell 起不来：${describeError(err)}`;
+      return null;
+    }
+    this.spawns += 1;
+    this.child = child;
+    child.stdout?.on('data', (chunk: Buffer) => {
+      // 没有请求在等的时候收到的字节不属于任何人（上一只的尾巴、或启动时的噪声），直接丢：
+      // 攒着它会让**下一次**请求被上一次的残留顶答（这条是测试抓出来的）。
+      if (!this.pending) return;
+      this.stdout += chunk.toString('utf8');
+      this.drain();
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      this.stderr += chunk.toString('utf8');
+      if (this.stderr.length > 8192) this.stderr = this.stderr.slice(-4096);
+    });
+    child.on('error', (err) => {
+      // 认人：被我们杀掉的那一只，它的 error/close 可能在新请求已经跑起来之后才到。
+      if (this.child !== child) return;
+      this.child = null;
+      this.failPending(`PowerShell 起不来：${err.message}`);
+    });
+    child.on('close', () => {
+      if (this.child !== child) return;
+      this.child = null;
+      // 助手在应答之前就退了：可能被拦、可能崩了。那一次按「没吐出结果」失败，绝不报假成功。
+      this.failPending(`PowerShell 没吐出结果${this.stderr.trim() ? `：${this.stderr.slice(-400)}` : ''}`);
+    });
+    return child;
   }
 
-  $edge = [Math]::Max($src.Width, $src.Height)
-  $downscaled = $edge -gt $maxEdge
-  if ($downscaled) {
-    $scale = $maxEdge / $edge
-    $nw = [Math]::Max(1, [int][Math]::Round($src.Width * $scale))
-    $nh = [Math]::Max(1, [int][Math]::Round($src.Height * $scale))
-    $small = New-Object System.Drawing.Bitmap -ArgumentList $nw, $nh
-    $g3 = [System.Drawing.Graphics]::FromImage($small)
-    $g3.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-    $g3.DrawImage($src, 0, 0, $nw, $nh)
-    $g3.Dispose()
-    $src.Dispose()
-    $src = $small
-  }
-  $ow = $src.Width
-  $oh = $src.Height
-  # 格线:画在**最终的图**上（降采样之后），所以线是 1px 的、标注也是按图上的字号来的。
-  # 每条线落在「桌面坐标的整百处」（密不下就翻倍），线旁边标着那个桌面坐标——
-  # 她照着数字读就行，不用拿图上像素去乘那个比例（她这么算错过两次）。
-  $gridInfo = $null
-  if (${grid ? '$true' : '$false'}) {
-    $ipx = $ow / $rect.w
-    $ipy = $oh / $rect.h
-    $step = ${GRID_BASE_STEP}
-    while (($step * $ipx) -lt ${GRID_MIN_GAP_PX}) { $step = $step * 2 }
-    $g4 = [System.Drawing.Graphics]::FromImage($src)
-    # 线选青色、半透明:白底黑底上都看得见，又不盖住底下的字。
-    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(95, 0, 190, 255)), 1
-    # 标注给一个深底白字的小方块——只留白字在浅色界面上会看不见。
-    $back = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(165, 20, 20, 20))
-    $ink = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(235, 255, 255, 255))
-    $font = New-Object System.Drawing.Font 'Consolas', 11
-    $vx = 0
-    $hy = 0
-    $dx = [Math]::Ceiling($rect.x / $step) * $step
-    while ($dx -lt ($rect.x + $rect.w)) {
-      $ix = [int][Math]::Round(($dx - $rect.x) * $ipx)
-      if ($ix -ge 0 -and $ix -lt $ow) {
-        $g4.DrawLine($pen, $ix, 0, $ix, $oh - 1)
-        $label = 'x=' + $dx
-        $sz = $g4.MeasureString($label, $font)
-        $g4.FillRectangle($back, $ix + 1, 1, [int]$sz.Width + 2, [int]$sz.Height + 1)
-        $g4.DrawString($label, $font, $ink, $ix + 2, 1)
-        $vx = $vx + 1
+  /** 从 stdout 里找**下一行**以 `{` 开头的 JSON——一行一条，前面混进来的噪声跳过。 */
+  private drain(): void {
+    const pending = this.pending;
+    if (!pending) return;
+    for (;;) {
+      const nl = this.stdout.indexOf('\n');
+      if (nl < 0) return;
+      const line = this.stdout.slice(0, nl).trim();
+      this.stdout = this.stdout.slice(nl + 1);
+      if (!line.startsWith('{')) continue;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue; // 不是完整 JSON 的行，继续找
       }
-      $dx = $dx + $step
-    }
-    $dy = [Math]::Ceiling($rect.y / $step) * $step
-    while ($dy -lt ($rect.y + $rect.h)) {
-      $iy = [int][Math]::Round(($dy - $rect.y) * $ipy)
-      if ($iy -ge 0 -and $iy -lt $oh) {
-        $g4.DrawLine($pen, 0, $iy, $ow - 1, $iy)
-        $label = 'y=' + $dy
-        $sz = $g4.MeasureString($label, $font)
-        $g4.FillRectangle($back, 1, $iy + 1, [int]$sz.Width + 2, [int]$sz.Height + 1)
-        $g4.DrawString($label, $font, $ink, 2, $iy + 1)
-        $hy = $hy + 1
-      }
-      $dy = $dy + $step
-    }
-    $g4.Dispose()
-    $pen.Dispose()
-    $back.Dispose()
-    $ink.Dispose()
-    $font.Dispose()
-    $gridInfo = @{ step = $step; vertical = $vx; horizontal = $hy }
-  }
-  # The pointer, onto the finished image; screen grab only (rationale above captureScript).
-  $draw = 'unknown'
-  $ipx = $ow / $rect.w
-  $ipy = $oh / $rect.h
-  if (-not $curOk) { $draw = 'unknown' }
-  elseif (-not ${drawCursor ? '$true' : '$false'}) { $draw = 'omitted' }
-  elseif ($via -eq 'printwindow') { $draw = 'printwindow' }
-  elseif (-not $curShown) { $draw = 'hidden' }
-  else {
-    $curIx = [int][Math]::Round(($curX - $rect.x) * $ipx)
-    $curIy = [int][Math]::Round(($curY - $rect.y) * $ipy)
-    if ($curIx -lt 0 -or $curIy -lt 0 -or $curIx -ge $ow -or $curIy -ge $oh) { $draw = 'offscreen' }
-    else {
-      $curSw = [PresenceCap]::GetSystemMetrics(13)
-      $curSh = [PresenceCap]::GetSystemMetrics(14)
-      if ($curSw -le 0) { $curSw = 32 }
-      if ($curSh -le 0) { $curSh = 32 }
-      # Its real size scaled with the picture, but never so small it cannot be seen.
-      $curDw = [int][Math]::Max(16, [int][Math]::Round($curSw * $ipx))
-      $curDh = [int][Math]::Max(16, [int][Math]::Round($curSh * $ipy))
-      $g5 = [System.Drawing.Graphics]::FromImage($src)
-      $hdc5 = $g5.GetHdc()
-      # 3 = DI_NORMAL. The handle belongs to the desktop and is never destroyed here.
-      if ([PresenceCap]::DrawIconEx($hdc5, $curIx, $curIy, $curIcon, $curDw, $curDh, 0, [IntPtr]::Zero, 3)) { $draw = 'drawn' }
-      $g5.ReleaseHdc($hdc5)
-      $g5.Dispose()
+      this.pending = null;
+      clearTimeout(pending.timer);
+      pending.resolve(parsed);
+      this.pump();
+      return;
     }
   }
-  $pngMs = New-Object System.IO.MemoryStream
-  $src.Save($pngMs, [System.Drawing.Imaging.ImageFormat]::Png)
-  $pngBytes = $pngMs.ToArray()
-  $pngMs.Dispose()
-  # 照片类画面（视频、照片、大片渐变）PNG 压不动，字节数会比像素数还大；那种画面转 JPEG，
-  # 体积差一个数量级。文字界面 PNG 压得很好，保持无损，字才清楚。
-  $pixels = [Math]::Max(1, $ow * $oh)
-  $ratio = $pngBytes.Length / $pixels
-  if ($ratio -gt ${PHOTO_BYTES_PER_PIXEL}) {
-    $bytes = Get-JpegBytes $src
-    $format = 'jpeg'
-  } else {
-    $bytes = $pngBytes
-    $format = 'png'
+
+  private failPending(message: string): void {
+    const pending = this.pending;
+    if (!pending) return;
+    this.pending = null;
+    clearTimeout(pending.timer);
+    pending.reject(new Error(message));
+    this.pump();
   }
-  $src.Dispose()
-  $b64 = [Convert]::ToBase64String($bytes)
-  $captured = @{ x = $rect.x; y = $rect.y; width = $rect.w; height = $rect.h }
-  Out-Json @{ ok = $true; data = $b64; format = $format; bytes = $bytes.Length; width = $ow; height = $oh; captured = $captured; downscaled = $downscaled; via = $via; title = $title; grid = $gridInfo; cursor = @{ x = $(if ($curOk) { $curX } else { $null }); y = $(if ($curOk) { $curY } else { $null }); draw = $draw } }
-} catch {
-  Out-Json @{ ok = $false; error = $_.Exception.Message }
-}
-`.trim();
+
+  /** 杀掉助手并清掉缓冲。不碰排队里的请求（调用方自己决定怎么交回）。 */
+  private kill(): void {
+    const child = this.child;
+    this.child = null;
+    this.stdout = '';
+    if (child && child.exitCode === null) child.kill();
+  }
 }
 
-/** 列可见顶层窗口（跳过披隐藏斗篷的 UWP 壳），带上矩形；同时报屏幕几何。 */
-function listWindowsScript(): string {
-  return `
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Windows.Forms | Out-Null
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public static class PresenceList {
-  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc callback, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, ref RECT rect);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int sizeOfValue);
+function describeError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
-'@
-# 窗口外框尺寸走 DWM(9 = EXTENDED_FRAME_BOUNDS)，拿到的是不含投影的真实边界。
-# 与上面那个 out int 的重载同名，所以另起一个托管类、用 EntryPoint 指回同一个入口。
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class PresenceFrame {
-  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-  [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")] public static extern int Frame(IntPtr hwnd, int attribute, out RECT rect, int sizeOfRect);
-  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-  [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
-}
-'@
-try { [void][PresenceFrame]::SetProcessDpiAwareness(2) } catch { try { [void][PresenceFrame]::SetProcessDPIAware() } catch {} }
 
-$fg = [PresenceList]::GetForegroundWindow()
-$found = New-Object System.Collections.ArrayList
-$cap = ${WINDOW_LIST_CAP}
-$callback = [PresenceList+EnumProc]{
-  param($h, $l)
-  if ($found.Count -ge $cap) { return $false }
-  if (-not [PresenceList]::IsWindowVisible($h)) { return $true }
-  $sb = New-Object System.Text.StringBuilder 512
-  [void][PresenceList]::GetWindowText($h, $sb, 512)
-  $t = $sb.ToString()
-  if ($t.Length -le 0) { return $true }
-  $cloaked = 0
-  [void][PresenceList]::DwmGetWindowAttribute($h, 14, [ref]$cloaked, 4)
-  if ($cloaked -ne 0) { return $true }
-  $procId = [uint32]0
-  [void][PresenceList]::GetWindowThreadProcessId($h, [ref]$procId)
-  $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
-  $minimized = [PresenceList]::IsIconic($h)
-  # 最小化的窗口没有可用位置（GetWindowRect 给的是 -32000 那种哨兵值），
-  # 报上去只会让她算出没用的坐标，所以四个值给 0，由回执标「最小化」。
-  $bx = 0; $by = 0; $bw = 0; $bh = 0
-  if (-not $minimized) {
-    $r = New-Object 'PresenceFrame+RECT'
-    $hr = [PresenceFrame]::Frame($h, 9, [ref]$r, [System.Runtime.InteropServices.Marshal]::SizeOf($r))
-    if ($hr -ne 0 -or ($r.Right - $r.Left) -le 0) {
-      $r = New-Object 'PresenceFrame+RECT'
-      [void][PresenceList]::GetWindowRect($h, [ref]$r)
-    }
-    $bx = $r.Left; $by = $r.Top; $bw = $r.Right - $r.Left; $bh = $r.Bottom - $r.Top
-  }
-  [void]$found.Add(@{
-    hwnd = $h.ToInt64()
-    title = $t
-    exe = $(if ($p) { $p.ProcessName } else { '' })
-    pid = $procId
-    foreground = ($h -eq $fg)
-    minimized = $minimized
-    bounds = @{ x = $bx; y = $by; width = $bw; height = $bh }
-  })
-  return $true
-}
-[void][PresenceList]::EnumWindows($callback, [IntPtr]::Zero)
+const HOST = new CaptureHost();
 
-$vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
-$mons = New-Object System.Collections.ArrayList
-$i = 0
-foreach ($s in [System.Windows.Forms.Screen]::AllScreens) {
-  [void]$mons.Add(@{
-    index = $i
-    x = $s.Bounds.Left
-    y = $s.Bounds.Top
-    width = $s.Bounds.Width
-    height = $s.Bounds.Height
-    primary = $s.Primary
-  })
-  $i = $i + 1
+/** 助手起过几只（测试用：两次调用应当只有一只）。 */
+export function captureHostSpawns(): number {
+  return HOST.spawnCount();
 }
-$screen = @{ x = $vs.Left; y = $vs.Top; width = $vs.Width; height = $vs.Height; monitors = $mons }
-@{ ok = $true; windows = $found; screen = $screen } | ConvertTo-Json -Compress -Depth 6 | Write-Output
-`.trim();
+
+/** World 收工时把助手一起收掉；不抛错。 */
+export async function stopCaptureHost(): Promise<void> {
+  await HOST.stop();
 }
 
 function asBuffer(value: unknown): Buffer {
@@ -622,6 +413,27 @@ export function parseRegion(args: Record<string, unknown>): Rect | string {
   return { x, y, width, height };
 }
 
+/** 助手要的那条命令：目标与两个开关现读；区域只在 region 那条有意义（其余给 0，脚本不看）。 */
+function captureCommand(target: ScreenshotTarget, grid: boolean, cursor: boolean): Record<string, unknown> {
+  return {
+    op: 'capture',
+    target: target.target,
+    hwnd: target.target === 'window' ? Math.trunc(target.hwnd) : 0,
+    region:
+      target.target === 'region'
+        ? { x: target.region.x, y: target.region.y, width: target.region.width, height: target.region.height }
+        : { x: 0, y: 0, width: 0, height: 0 },
+    grid,
+    cursor,
+    // 包里那几个常量随命令过去：.ps1 里不写一份，免得两处各说各话。
+    maxEdge: SCREENSHOT_MAX_EDGE,
+    jpegQuality: JPEG_QUALITY,
+    gridBase: GRID_BASE_STEP,
+    gridMinGap: GRID_MIN_GAP_PX,
+    photoRatio: PHOTO_BYTES_PER_PIXEL,
+  };
+}
+
 /** 截一张。她说要才调用；失败抛错（World 转成失败回执），错误文案给人看。 */
 export async function captureScreenshot(
   target: ScreenshotTarget,
@@ -630,7 +442,7 @@ export async function captureScreenshot(
 ): Promise<ScreenshotResult> {
   const grid = options.grid === true;
   const drawCursor = options.cursor !== false;
-  const result = await runPowerShellJson(captureScript(target, grid, drawCursor), timeoutMs);
+  const result = await HOST.request(captureCommand(target, grid, drawCursor), timeoutMs);
   if (result.ok !== true) {
     throw new Error(typeof result.error === 'string' ? result.error : '截图失败，原因不明');
   }
@@ -683,7 +495,7 @@ function parseGrid(raw: unknown): GridInfo | null {
 }
 
 /**
- * 格线在这个缩放下的间距（桌面像素）。与 `captureScript` 里那段同一条规则——
+ * 格线在这个缩放下的间距（桌面像素）。与 `captureHostScript` 里那段同一条规则——
  * 回执要预告「要是加了格线，间距会是多少」，那就得和真画出来的那个数一致。
  */
 export function gridStepFor(imageWidth: number, capturedWidth: number): number {
@@ -771,7 +583,7 @@ function asArray<T>(value: unknown): T[] {
 
 /** 列一遍可见窗口，附带屏幕几何。失败抛错。 */
 export async function listWindows(timeoutMs = 15000): Promise<WindowList> {
-  const result = await runPowerShellJson(listWindowsScript(), timeoutMs);
+  const result = await HOST.request({ op: 'windows', windowCap: WINDOW_LIST_CAP }, timeoutMs);
   if (result.ok !== true) {
     throw new Error(typeof result.error === 'string' ? result.error : '列不出窗口');
   }
