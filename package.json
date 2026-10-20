@@ -1,11 +1,11 @@
 {
   "name": "cortico-world-presence",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "author": {
     "name": "筆離嘢"
   },
-  "description": "Cortico World: 在场感（Windows 专用）——能判别你是否离开/回到电脑前。★ 它会持续读前台窗口标题与键鼠空闲、并能截屏(屏幕上有什么截到什么),这些随模型调用发到你部署配置的模型端点;默认不启用。详细隐私说明见 README。",
+  "description": "Cortico World: 在场感（Windows 专用）——能判别你是否离开/回到电脑前。★ 它会持续读前台窗口标题与键鼠空闲、并能截屏(屏幕上有什么截到什么),这些随模型调用发到你部署配置的模型端点;默认不启用。详细隐私说明见 README。 ★ 支持 Coopanion(Coo):已在 Coopanion 0.2.5 上装机验证;出问题可去 GitHub 提 issue,或到 QQ 群里 @筆離嘢(与作者名同名)。",
   "license": "MIT",
   "repository": {
     "type": "git",

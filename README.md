@@ -30,6 +30,19 @@ Windows 专用(传感器与截图都走 Win32,经由系统自带的 PowerShell,�
 > ②你信得过那个端点的留存策略。想收紧就靠 `enabled`、`pollIntervalMs`,以及**不在不该开的时候开着**
 > (它没有「只截某个程序」「模糊标题」这类旋钮,**这是刻意的**:本包不做隐私开关,是开发者的拍板,不是漏做)。
 
+## 在 Coopanion(Coo)上使用
+
+已在 **Coopanion 0.2.5**(Windows x64 便携版)上装机验收:市场里检查与安装成功,重启后**导入成功**;
+启用后传感器 `online`,`presence_windows` 的空闲值与前台窗口采样都有效。默认 `digest` 挡首帧只打底,
+不会立刻投事件 —— 想看到东西要先压到 1 分钟或调一次 `presence_windows`。这一次没有单独测截图。
+
+Coo 的扩展市场默认可能走镜像源(npmmirror),镜像上偶尔还没有新版本 —— 检查时报「registry 没有给出
+cortico-world-presence 的 x.y.z 版本」,就把 Coo 的扩展源改成官方 `https://registry.npmjs.org` 再装。
+装完或改过配置要**整进程重启** Coo 才生效。
+
+**遇到问题**:去 GitHub 开 issue —— https://github.com/biliye/cortico-world-presence/issues;
+或者到 QQ 群里 @筆離嘢(和作者名同名)。附上 Coo 版本、本包版本和报错截图,再说清是哪一步出的。
+
 ## 怎么装
 
 Windows 专用,**零安装** —— 传感器与截图都走系统自带的 PowerShell,不用装任何别的东西。
